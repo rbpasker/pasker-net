@@ -7,9 +7,11 @@ Shared utility modules for personal projects.
 - [`secretvault/`](secretvault/) — macOS Keychain-backed secret storage with
   env-var fallback. Pluggable backends, namespace-per-app via Keychain service
   name. Adapted from roscoe-mcp.
-- [`versioning/`](versioning/) — `canonical_version("1.3", repo_root=...)` →
-  `1.3[-<branch>]-<commit>[-dirty]`. Branch is omitted on `main`/`master`.
-  Stdlib only; returns `<version>-unknown` outside a git repo.
+- [`versioning/`](versioning/) — `canonical_version("2.0", repo_root=..., os_version=current_os())`
+  → `2.0[-<branch>]-<commit>[-dirty][ (<os>)]`. Branch is omitted on
+  `main`/`master`. Ships `emit_swift.py` to generate an equivalent
+  `CanonicalVersion` Swift enum from an Xcode Run Script Phase. Stdlib
+  only; returns `<version>-unknown` outside a git repo.
 
 ## Use as a git submodule
 
