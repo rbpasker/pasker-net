@@ -7,6 +7,9 @@ Shared utility modules for personal projects.
 - [`secretvault/`](secretvault/) — macOS Keychain-backed secret storage with
   env-var fallback. Pluggable backends, namespace-per-app via Keychain service
   name. Adapted from roscoe-mcp.
+- [`versioning/`](versioning/) — `canonical_version("1.3", repo_root=...)` →
+  `1.3[-<branch>]-<commit>[-dirty]`. Branch is omitted on `main`/`master`.
+  Stdlib only; returns `<version>-unknown` outside a git repo.
 
 ## Use as a git submodule
 
