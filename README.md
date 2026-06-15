@@ -12,6 +12,12 @@ Shared utility modules for personal projects.
   `main`/`master`. Ships `emit_swift.py` to generate an equivalent
   `CanonicalVersion` Swift enum from an Xcode Run Script Phase. Stdlib
   only; returns `<version>-unknown` outside a git repo.
+- [`queuing/`](queuing/) — SQL-backed named FIFO queues that share the
+  caller's database and ride the caller's transactions. One `q_item`
+  table, all queues. Queue mutations commit atomically with the worker's
+  durable writes — no drift between "queue says done" and "audit says
+  done." Projection-based boot recovery and self-heal. Stdlib only
+  (`sqlite3`).
 
 ## Use as a git submodule
 
