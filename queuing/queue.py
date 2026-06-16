@@ -85,6 +85,12 @@ class Queue(Generic[T]):
         self._projection = projection
         self._items: deque[T] = deque()
         self._lock = threading.Lock()
+        # Lifetime counters for stats(). Incremented in enqueue/dequeue/
+        # populate; never decremented. Reflect "how many items have ever
+        # been added/taken via this Queue object" — not the current
+        # depth, which is len(self._items).
+        self._enq_count = 0
+        self._deq_count = 0
         # Wake-up signal for blocked workers — set by enqueue. Sticky
         # threading.Event: a set() before a wait() is not lost. Consumed
         # by future worker harnesses that want to block on an empty queue
@@ -108,6 +114,7 @@ class Queue(Generic[T]):
             if item in self._items:
                 return False
             self._items.append(item)
+            self._enq_count += 1
         self._ready.set()
         return True
 
@@ -125,7 +132,9 @@ class Queue(Generic[T]):
         with self._lock:
             if not self._items:
                 return None
-            return self._items.popleft()
+            item = self._items.popleft()
+            self._deq_count += 1
+            return item
 
     def wait_for_item(self, timeout: float | None = None) -> bool:
         """Block until an item is available, `wake()` is called, or
@@ -198,6 +207,7 @@ class Queue(Generic[T]):
                 if item in self._items:
                     continue
                 self._items.append(item)
+                self._enq_count += 1
                 added += 1
         return added
 
@@ -206,6 +216,20 @@ class Queue(Generic[T]):
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)
+
+    def stats(self) -> tuple[int, int, int]:
+        """Return `(enq_count, deq_count, current_depth)`.
+
+        - `enq_count`: lifetime count of successful `enqueue()` /
+          `populate()` adds (duplicates and no-ops not counted).
+        - `deq_count`: lifetime count of successful `dequeue()` calls
+          (None returns not counted).
+        - `current_depth`: how many items are pending right now, i.e.
+          `len(self)`. Equals `enq_count - deq_count` modulo any items
+          consumed by ack/drop paths the consumer manages externally.
+        """
+        with self._lock:
+            return (self._enq_count, self._deq_count, len(self._items))
 
     def snapshot(self) -> list[T]:
         """Return a fresh list of currently pending items, in FIFO order.
@@ -282,6 +306,13 @@ class QueueRegistry:
         with self._lock:
             queues = list(self._queues.items())
         return {name: len(q) for name, q in queues}
+
+    def stats(self) -> dict[str, tuple[int, int, int]]:
+        """`{queue_name: (enq_count, deq_count, current_depth)}` for
+        every registered queue. See `Queue.stats()`."""
+        with self._lock:
+            queues = list(self._queues.items())
+        return {name: q.stats() for name, q in queues}
 
     def register_from_table(
         self,

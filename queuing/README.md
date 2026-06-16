@@ -144,6 +144,7 @@ class Queue:
     def wait_for_item(timeout: float | None = None) -> bool
     def wake() -> None
     def populate(projection: Callable | None = None) -> int
+    def stats() -> tuple[int, int, int]   # (enq, deq, depth)
     def snapshot() -> list
     def __len__() -> int
 
@@ -154,6 +155,7 @@ class QueueRegistry:
     def names() -> list[str]
     def populate_all() -> dict[str, int]
     def depths() -> dict[str, int]
+    def stats() -> dict[str, tuple[int, int, int]]    # per-queue (enq, deq, depth)
     def register_from_table(
         conn_or_factory, table: str, queue_names: Iterable[str], *,
         q_column: str = "q_name", id_column: str = "id",
