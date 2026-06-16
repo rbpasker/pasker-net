@@ -1,36 +1,17 @@
-"""In-memory named FIFO queues whose contents are derived from a
-projection of the consuming app's durable state.
+"""In-memory named FIFO queues populated from a projection of the
+consumer's durable state.
 
-Design — three properties carry the abstraction:
-
-1. **The queue is in-memory.** Just a `deque` per named queue. No backing
-   table, no broker hop, no serialization tax. Enqueue and dequeue happen
-   at Python speed.
-
-2. **The on-disk source of truth is the consuming app's own audit
-   tables.** Each queue is constructed with a `projection` callable that
-   returns "what should be on this queue right now" by inspecting the
-   durable state of the consumer (typically a SQL query over its existing
-   rows). The library never owns a row; the consumer's tables are the
-   truth.
-
-3. **At-least-once delivery from automatic recovery.** Workers dequeue
-   items, do their work inside a database transaction that advances the
-   audit state (writing the next-stage row, advancing task status,
-   whatever), and commit. On commit, the worker enqueues the payload to
-   the next queue's in-memory deque as a latency-saving notification.
-   If anything fails between dequeue and commit, the on-disk state did
-   not move and the projection will re-derive the same item on its next
-   call. Workers must be idempotent — calling them twice with the same
-   payload must be safe — which matches the discipline real audit
-   pipelines already follow.
-
-What this is NOT: a broker. Single-process only — the in-memory deque is
-not shared across processes. There is no peek/ack/nack model and no
-queue-level lock; correctness comes from the consumer's transaction plus
-the projection. If you outgrow single-process, swap this library for one
-that wraps Redis Streams / NATS JetStream / RabbitMQ behind the same
-`Queue` interface; the consumer code does not change.
+- A `deque` per named queue. Enqueue and dequeue are O(1) and atomic
+  across threads in this process.
+- Each queue is constructed with a `projection` callable that returns
+  the items that should currently be on the queue, by inspecting the
+  consumer's audit tables. The library holds no on-disk state of its
+  own.
+- Workers dequeue items, advance the consumer's audit state in a
+  transaction, and commit; on commit, the worker enqueues the payload
+  to the next queue's in-memory deque as a notification. At the next
+  process start, `populate()` rebuilds the deques from the projection;
+  that is the recovery mechanism. Workers must be idempotent.
 """
 from __future__ import annotations
 
@@ -103,7 +84,6 @@ class Queue(Generic[T]):
         self.name = name
         self._projection = projection
         self._items: deque[T] = deque()
-        self._seen: set[T] = set()           # dedup against re-projection
         self._lock = threading.Lock()
         # Wake-up signal for blocked workers — set by enqueue. Sticky
         # threading.Event: a set() before a wait() is not lost. Consumed
@@ -125,10 +105,9 @@ class Queue(Generic[T]):
         Sets the wake-up event so any thread blocked in
         `wait_for_item()` is unparked."""
         with self._lock:
-            if item in self._seen:
+            if item in self._items:
                 return False
             self._items.append(item)
-            self._seen.add(item)
         self._ready.set()
         return True
 
@@ -141,14 +120,12 @@ class Queue(Generic[T]):
         in-memory queue immediately and the worker takes responsibility
         for advancing the on-disk audit state in a transaction. If the
         worker fails before the audit commits, the on-disk state is
-        unchanged and the projection will re-derive the item on the next
-        `repopulate()` — at-least-once delivery."""
+        unchanged; recovery happens at the next process restart when
+        `populate()` re-derives the item from the projection."""
         with self._lock:
             if not self._items:
                 return None
-            item = self._items.popleft()
-            self._seen.discard(item)
-            return item
+            return self._items.popleft()
 
     def wait_for_item(self, timeout: float | None = None) -> bool:
         """Block until an item is available, `wake()` is called, or
@@ -184,9 +161,9 @@ class Queue(Generic[T]):
         checks its stop flag, and exits."""
         self._ready.set()
 
-    # ----- projection / recovery -----------------------------------------
+    # ----- projection / boot recovery -----------------------------------
 
-    def repopulate(
+    def populate(
         self,
         projection: Callable[[], Iterable[T]] | None = None,
     ) -> int:
@@ -194,11 +171,14 @@ class Queue(Generic[T]):
         that are not already in the queue. Returns the number of items
         added.
 
-        Use at boot to derive queue contents from the consumer's audit
-        state. Run periodically as a self-heal sweep to patch up any
-        items the projection says should be queued but aren't (e.g., a
-        worker died between commit and in-memory enqueue, or the process
-        restarted).
+        Call once at process start to derive the queue's contents from
+        the consumer's audit state. The in-memory deque is empty until
+        you do — the library does not populate itself.
+
+        The projection must return unique items; the cross-call dedup
+        (skip items already in the deque) is here to handle the case
+        where `populate` is called more than once, not to fix a
+        consumer that emits duplicates within one call.
 
         If `projection` is omitted, the projection passed to `__init__`
         is used. Calling without either raises ValueError."""
@@ -206,7 +186,7 @@ class Queue(Generic[T]):
         if proj is None:
             raise ValueError(
                 f"queue {self.name!r} has no projection — pass one to "
-                "__init__ or to repopulate()"
+                "__init__ or to populate()"
             )
         # Materialize the projection results OUTSIDE the lock — the
         # callable typically runs a SQL query that may take milliseconds
@@ -215,10 +195,9 @@ class Queue(Generic[T]):
         added = 0
         with self._lock:
             for item in items:
-                if item in self._seen:
+                if item in self._items:
                     continue
                 self._items.append(item)
-                self._seen.add(item)
                 added += 1
         return added
 
@@ -241,15 +220,15 @@ class Queue(Generic[T]):
 
 
 class QueueRegistry:
-    """A named collection of Queues, with bulk operations for boot and
-    self-heal. Use when the consuming system has a fixed set of named
-    queues (one per pipeline stage, one per executor):
+    """A named collection of Queues, with bulk boot-population. Use when
+    the consuming system has a fixed set of named queues (one per
+    pipeline stage, one per executor):
 
         reg = QueueRegistry()
         reg.register("categorize", projection=lambda: db.find_ready_for("categorize"))
         reg.register("request",    projection=lambda: db.find_ready_for("request"))
         reg.register("research",   projection=lambda: db.find_pending_agent("research"))
-        reg.repopulate_all()
+        reg.populate_all()
     """
 
     def __init__(self) -> None:
@@ -276,22 +255,26 @@ class QueueRegistry:
         with self._lock:
             return self._queues[name]
 
+    def __contains__(self, name: str) -> bool:
+        with self._lock:
+            return name in self._queues
+
     def names(self) -> list[str]:
         """All registered queue names, in registration order."""
         with self._lock:
             return list(self._queues)
 
-    def repopulate_all(self) -> dict[str, int]:
-        """Repopulate every queue that has a projection. Returns
+    def populate_all(self) -> dict[str, int]:
+        """Populate every queue that has a projection. Returns
         `{queue_name: items_added}`. Queues without a projection are
-        skipped silently."""
+        skipped silently. Call once at process start."""
         with self._lock:
             queues = list(self._queues.items())
         out: dict[str, int] = {}
         for name, q in queues:
             if q._projection is None:
                 continue
-            out[name] = q.repopulate()
+            out[name] = q.populate()
         return out
 
     def depths(self) -> dict[str, int]:

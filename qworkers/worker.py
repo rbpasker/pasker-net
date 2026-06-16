@@ -1,31 +1,15 @@
-"""WorkerSystem — run N thread workers, one per (qname, process) pair,
-each looping on its named queue and calling `process(entry, conn, registry)`
-for every dequeued item.
+"""WorkerSystem — run one daemon thread per (qname, process) pair,
+each looping on its named queue and calling
+`process(entry, conn, registry)` for every dequeued item.
 
-Design — three properties carry the abstraction:
-
-1. **One thread per pair.** Pass `[(qname, process_fn), ...]`; the system
-   spawns `len(pairs)` daemon threads, each dedicated to one queue. To
-   run a worker POOL on the same queue (e.g., a research-agent pool),
-   repeat the pair: `[("research", agent_process), ("research", agent_process)]`.
-
-2. **Wait, don't poll.** Workers block in `Queue.wait_for_item()` when
-   the queue is empty, with a bounded timeout so the stop signal is
-   noticed within `wait_timeout` seconds. `enqueue` sets the queue's
-   `_ready` event; `wake()` is fired during shutdown to unblock all
-   workers. No CPU burn while idle.
-
-3. **At-least-once.** A worker that raises during `process` is logged
-   and continues — the consumer's audit row was never committed (its
-   transaction rolled back), so the next projection sweep re-derives
-   the item. Workers must therefore be idempotent. This matches the
-   discipline real audit pipelines already use (ON CONFLICT keys,
-   monotonic status machines).
-
-What this is NOT: a process supervisor. Workers are threads in the
-calling process; they die with it. For a multi-process setup, swap
-the underlying `queuing.Queue` for a real broker behind the same
-`Queue` interface; the consumer code does not change.
+- One thread per pair; pass `[(qname, process_fn), ...]`. Repeat a
+  qname to run a worker pool on the same queue.
+- Workers block in `Queue.wait_for_item()` when the queue is empty,
+  with a bounded timeout so the stop signal is observed promptly.
+- Exceptions raised inside `process` are logged; the worker continues
+  to the next item. Recovery for dropped items happens at the next
+  process restart via `Queue.populate()`. Process functions must be
+  idempotent.
 """
 from __future__ import annotations
 
@@ -138,17 +122,15 @@ class WorkerSystem:
     def stop(self, *, join_timeout: float | None = None) -> None:
         """Signal workers to stop and wake any waiting on empty queues.
         If `join_timeout` is given, also wait up to that many seconds
-        per thread for clean exit. Idempotent."""
+        per thread for clean exit. Idempotent.
+
+        `__init__` guaranteed every qname in `pairs` is registered, so
+        `wake()` is unconditional. The set comprehension deduplicates so
+        a queue with N workers is only woken once (one Event.set()
+        unblocks all waiters)."""
         self._stop.set()
-        # Wake every worker so they exit wait_for_item promptly. Use a
-        # set of distinct qnames in case the same queue has multiple
-        # workers — one wake() call suffices for any number of waiters
-        # on the same Event.
         for qname in {q for q, _ in self._pairs}:
-            try:
-                self._registry.get(qname).wake()
-            except KeyError:
-                pass
+            self._registry.get(qname).wake()
         if join_timeout is not None:
             for t in self._threads:
                 t.join(timeout=join_timeout)
@@ -186,10 +168,11 @@ class WorkerSystem:
                 try:
                     process(entry, conn, self._registry)
                 except Exception:
-                    # At-least-once recovery: the consumer's transaction
-                    # rolled back (no audit row committed); the projection
-                    # will re-derive this entry on the next sweep. Workers
-                    # MUST be idempotent for this to be correct.
+                    # process raised; the consumer's transaction (if any)
+                    # rolled back. The item is dropped from this run.
+                    # Recovery happens at the next process restart via
+                    # populate(). For intra-run retry, catch and
+                    # re-enqueue from inside process.
                     log.exception(
                         "qworker:%s#%d process raised on entry %r",
                         qname, index, entry,
