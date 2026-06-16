@@ -118,6 +118,23 @@ class Queue(Generic[T]):
         self._ready.set()
         return True
 
+    def enqueue_head(self, item: T) -> bool:
+        """Insert `item` at the HEAD of the queue, so the next
+        `dequeue()` returns it. Same dedup as `enqueue` (no-op if the
+        item is already pending). Returns True if inserted, False on
+        dedup. Counts toward `stats().enq_count` on success.
+
+        Use when an item needs immediate-retry priority — e.g., a
+        worker that wants to re-route the entry it just dequeued to
+        the front of the line rather than the back."""
+        with self._lock:
+            if item in self._items:
+                return False
+            self._items.appendleft(item)
+            self._enq_count += 1
+        self._ready.set()
+        return True
+
     # ----- consumer side -------------------------------------------------
 
     def dequeue(self) -> T | None:

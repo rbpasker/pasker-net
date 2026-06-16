@@ -140,6 +140,7 @@ class Queue:
     def __init__(name: str,
                  projection: Callable[[], Iterable] | None = None)
     def enqueue(item) -> bool
+    def enqueue_head(item) -> bool
     def dequeue() -> item | None
     def wait_for_item(timeout: float | None = None) -> bool
     def wake() -> None
