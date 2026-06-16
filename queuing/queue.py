@@ -17,11 +17,24 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
+
+
+@dataclass
+class QItem(Generic[T]):
+    """A queued item paired with its enqueue timestamp (monotonic).
+    `payload` is whatever the producer passed (an id, a dict, etc.);
+    `enq_ts` is `time.monotonic()` at the moment of enqueue. The
+    dequeue path returns `payload` only — `enq_ts` is consumed by the
+    queue's wait-time accumulator."""
+    payload: Any
+    enq_ts: float
 
 # Identifier validator for table/column names that get interpolated into
 # SQL. SQLite has no `?` binding for identifiers, so the only safe way to
@@ -83,7 +96,7 @@ class Queue(Generic[T]):
             )
         self.name = name
         self._projection = projection
-        self._items: deque[T] = deque()
+        self._items: deque[QItem] = deque()
         self._lock = threading.Lock()
         # Lifetime counters for stats(). Incremented in enqueue/dequeue/
         # populate; never decremented. Reflect "how many items have ever
@@ -91,6 +104,10 @@ class Queue(Generic[T]):
         # depth, which is len(self._items).
         self._enq_count = 0
         self._deq_count = 0
+        # Cumulative wait time across all dequeues: sum of
+        # (deq_ts - enq_ts) per item. stats() divides by deq_count
+        # to get average time-on-queue.
+        self._wait_total_s = 0.0
         # Wake-up signal for blocked workers — set by enqueue. Sticky
         # threading.Event: a set() before a wait() is not lost. Consumed
         # by future worker harnesses that want to block on an empty queue
@@ -99,38 +116,31 @@ class Queue(Generic[T]):
 
     # ----- producer side -------------------------------------------------
 
+    def _contains_payload(self, payload: T) -> bool:
+        """Dedup check: True if any QItem in the deque wraps `payload`."""
+        return any(qi.payload == payload for qi in self._items)
+
     def enqueue(self, item: T) -> bool:
-        """Append `item` to the tail. Idempotent: enqueuing the same item
-        twice while it's still pending is a no-op. Returns True if the
-        item was added, False if it was already in the queue.
-
-        Call AFTER the worker's transaction has committed — the on-disk
-        state already reflects the next-queue assignment; this is a
-        latency-saving notification to the in-memory deque.
-
-        Sets the wake-up event so any thread blocked in
-        `wait_for_item()` is unparked."""
+        """Append `item` to the tail. Idempotent on payload: enqueuing
+        the same payload while a prior one is still pending is a no-op.
+        Returns True if the item was added, False if it was already in
+        the queue. The QItem's `enq_ts` is `time.monotonic()` at this
+        call, used by dequeue() to accumulate wait time."""
         with self._lock:
-            if item in self._items:
+            if self._contains_payload(item):
                 return False
-            self._items.append(item)
+            self._items.append(QItem(payload=item, enq_ts=time.monotonic()))
             self._enq_count += 1
         self._ready.set()
         return True
 
     def enqueue_head(self, item: T) -> bool:
         """Insert `item` at the HEAD of the queue, so the next
-        `dequeue()` returns it. Same dedup as `enqueue` (no-op if the
-        item is already pending). Returns True if inserted, False on
-        dedup. Counts toward `stats().enq_count` on success.
-
-        Use when an item needs immediate-retry priority — e.g., a
-        worker that wants to re-route the entry it just dequeued to
-        the front of the line rather than the back."""
+        `dequeue()` returns it. Same payload-dedup as `enqueue`."""
         with self._lock:
-            if item in self._items:
+            if self._contains_payload(item):
                 return False
-            self._items.appendleft(item)
+            self._items.appendleft(QItem(payload=item, enq_ts=time.monotonic()))
             self._enq_count += 1
         self._ready.set()
         return True
@@ -138,20 +148,16 @@ class Queue(Generic[T]):
     # ----- consumer side -------------------------------------------------
 
     def dequeue(self) -> T | None:
-        """Pop the oldest item. Returns None if the queue is empty.
-
-        The dequeue is atomic within this process. The item leaves the
-        in-memory queue immediately and the worker takes responsibility
-        for advancing the on-disk audit state in a transaction. If the
-        worker fails before the audit commits, the on-disk state is
-        unchanged; recovery happens at the next process restart when
-        `populate()` re-derives the item from the projection."""
+        """Pop the oldest item's payload. Returns None if the queue is
+        empty. Accumulates `(deq_ts - enq_ts)` into `_wait_total_s` so
+        stats() can report average time-on-queue."""
         with self._lock:
             if not self._items:
                 return None
-            item = self._items.popleft()
+            qi = self._items.popleft()
             self._deq_count += 1
-            return item
+            self._wait_total_s += time.monotonic() - qi.enq_ts
+            return qi.payload
 
     def wait_for_item(self, timeout: float | None = None) -> bool:
         """Block until an item is available, `wake()` is called, or
@@ -221,9 +227,9 @@ class Queue(Generic[T]):
         added = 0
         with self._lock:
             for item in items:
-                if item in self._items:
+                if self._contains_payload(item):
                     continue
-                self._items.append(item)
+                self._items.append(QItem(payload=item, enq_ts=time.monotonic()))
                 self._enq_count += 1
                 added += 1
         return added
@@ -234,27 +240,37 @@ class Queue(Generic[T]):
         with self._lock:
             return len(self._items)
 
-    def stats(self) -> tuple[int, int, int]:
-        """Return `(enq_count, deq_count, current_depth)`.
+    def stats(self) -> tuple[int, int, int, float, float]:
+        """Return `(enq_count, deq_count, current_depth, wait_total_s,
+        wait_avg_s)`.
 
         - `enq_count`: lifetime count of successful `enqueue()` /
           `populate()` adds (duplicates and no-ops not counted).
         - `deq_count`: lifetime count of successful `dequeue()` calls
           (None returns not counted).
-        - `current_depth`: how many items are pending right now, i.e.
-          `len(self)`. Equals `enq_count - deq_count` modulo any items
-          consumed by ack/drop paths the consumer manages externally.
+        - `current_depth`: items pending right now, i.e. `len(self)`.
+        - `wait_total_s`: cumulative time items have spent on the queue,
+          summed across all dequeues (`sum(deq_ts - enq_ts)`).
+        - `wait_avg_s`: `wait_total_s / deq_count` — average time an
+          item spent on the queue before being processed. `0.0` when
+          `deq_count == 0`.
         """
         with self._lock:
-            return (self._enq_count, self._deq_count, len(self._items))
+            avg = self._wait_total_s / self._deq_count if self._deq_count else 0.0
+            return (
+                self._enq_count,
+                self._deq_count,
+                len(self._items),
+                self._wait_total_s,
+                avg,
+            )
 
     def snapshot(self) -> list[T]:
-        """Return a fresh list of currently pending items, in FIFO order.
-        For dashboards and diagnostics only — do not use to drive control
-        flow. The caller may mutate the returned list without affecting
-        queue state."""
+        """Return a fresh list of currently pending payloads, in FIFO
+        order. For dashboards and diagnostics only — do not use to
+        drive control flow."""
         with self._lock:
-            return list(self._items)
+            return [qi.payload for qi in self._items]
 
 
 # ---------------------------- Registry -------------------------------- #
@@ -324,9 +340,9 @@ class QueueRegistry:
             queues = list(self._queues.items())
         return {name: len(q) for name, q in queues}
 
-    def stats(self) -> dict[str, tuple[int, int, int]]:
-        """`{queue_name: (enq_count, deq_count, current_depth)}` for
-        every registered queue. See `Queue.stats()`."""
+    def stats(self) -> dict[str, tuple[int, int, int, float, float]]:
+        """`{queue_name: (enq, deq, depth, wait_total_s, wait_avg_s)}`
+        for every registered queue. See `Queue.stats()`."""
         with self._lock:
             queues = list(self._queues.items())
         return {name: q.stats() for name, q in queues}
