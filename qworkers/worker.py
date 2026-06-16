@@ -19,11 +19,14 @@ every dequeued item.
   Process functions must be idempotent.
 - An optional `observer` callback receives `(event, qname, item)` for
   every worker-driven event:
-    "deq"  — item was dequeued from `qname`
-    "enq"  — item was enqueued to `qname` (next-queue, fan-out, or
-             error_queue)
-    "drop" — item was dropped after a process exception because no
-             error_queue was configured; `qname` is the source queue
+    "deq"      — item was dequeued from `qname`
+    "enq"      — item was enqueued to `qname` tail (next-queue,
+                 fan-out, or error_queue)
+    "enq_head" — item was re-enqueued at `qname`'s head after process
+                 raised `TransientException`
+    "drop"     — item was dropped after a process exception because no
+                 error_queue was configured; `qname` is the source
+                 queue
   See `LoggerObserver` for a sample that logs each event via Python
   logging.
 """
@@ -127,13 +130,17 @@ class WorkerSystem:
                       logged and the entry is dropped; recovery happens
                       at next process restart via Queue.populate().
         observer:     optional callable invoked with (event, qname, item)
-                      for every worker-driven event: "deq" (dequeued
-                      from qname), "enq" (enqueued to qname), "drop"
-                      (item dropped after process raised and no
-                      error_queue is configured; qname is the source
-                      queue). See LoggerObserver. Exceptions in the
-                      observer are caught and logged; they don't disrupt
-                      worker flow.
+                      for every worker-driven event:
+                        "deq"      — dequeued from qname
+                        "enq"      — enqueued to qname tail
+                        "enq_head" — re-enqueued at qname's head after
+                                     a TransientException
+                        "drop"     — dropped after process raised and
+                                     no error_queue is configured;
+                                     qname is the source queue
+                      See LoggerObserver. Exceptions in the observer
+                      are caught and logged; they don't disrupt worker
+                      flow.
         wait_timeout: how long a worker blocks in wait_for_item before
                       re-checking the stop flag.
         """
@@ -262,7 +269,7 @@ class WorkerSystem:
                         "re-queuing at head", qname, index, entry,
                     )
                     q.enqueue_head(entry)
-                    self._observe("enq", qname, entry)
+                    self._observe("enq_head", qname, entry)
                 except Exception:
                     log.exception(
                         "qworker:%s#%d process raised on entry %r",

@@ -143,11 +143,12 @@ same `entry` must produce the same final state.
 Pass an `observer` callable to the constructor to receive a callback
 for every worker-driven event:
 
-| event   | meaning                                                      |
-|---------|--------------------------------------------------------------|
-| `"deq"` | worker dequeued `item` from `qname`                          |
-| `"enq"` | worker enqueued `item` to `qname` (next-queue, fan-out, or error_queue) |
-| `"drop"`| `item` was dropped after process raised; no error_queue was set; `qname` is the source queue |
+| event        | meaning                                                                                       |
+|--------------|-----------------------------------------------------------------------------------------------|
+| `"deq"`      | worker dequeued `item` from `qname`                                                           |
+| `"enq"`      | worker enqueued `item` to `qname` tail (next-queue, fan-out, or error_queue)                  |
+| `"enq_head"` | worker re-enqueued `item` at `qname`'s head after process raised `TransientException`         |
+| `"drop"`     | `item` was dropped after process raised; no error_queue was set; `qname` is the source queue  |
 
 Signature:
 
