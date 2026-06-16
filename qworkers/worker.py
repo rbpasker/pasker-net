@@ -9,9 +9,12 @@ every dequeued item.
 - `process(entry, conn)` returns the next queue's name (`str`), a list
   of next queue names for fan-out (`list[str]`), or `None` for
   terminal. The worker handles routing; process is pure logic.
-- If `process` raises, the entry is routed to the configured
-  `error_queue` (if any) and the worker continues. Without an
-  error_queue, the exception is logged and the entry is dropped;
+- If `process` raises `TransientException`, the entry is re-enqueued
+  at the HEAD of its source queue (immediate retry); error_queue is
+  not involved.
+- If `process` raises any other exception, the entry is routed to the
+  configured `error_queue` (if any) and the worker continues. Without
+  an error_queue, the exception is logged and the entry is dropped;
   recovery happens at the next process restart via `Queue.populate()`.
   Process functions must be idempotent.
 - An optional `observer` callback receives `(event, qname, item)` for
@@ -34,6 +37,21 @@ from typing import Any
 from queuing import QueueRegistry
 
 log = logging.getLogger(__name__)
+
+
+class TransientException(Exception):
+    """Raised by a process function to signal a retryable failure.
+
+    The worker catches this specifically and re-enqueues the entry at
+    the HEAD of its source queue for immediate retry. The entry does
+    NOT route to the error_queue and is NOT dropped.
+
+    Use for transient conditions where the same input is expected to
+    succeed on a subsequent attempt — DB busy, network blip, rate-
+    limited downstream, temporary lock contention. Use any other
+    Exception type for permanent failures (those route to error_queue
+    or are logged-and-dropped).
+    """
 
 
 # A process function takes (entry, conn) and returns the next queue's
@@ -236,6 +254,15 @@ class WorkerSystem:
                             self._registry.get(next_qname).enqueue(entry)
                             self._observe("enq", next_qname, entry)
                     # result is None → terminal; nothing to do.
+                except TransientException:
+                    # Retryable: put the entry back at the HEAD of the
+                    # source queue. Does NOT route to error_queue.
+                    log.warning(
+                        "qworker:%s#%d transient on entry %r; "
+                        "re-queuing at head", qname, index, entry,
+                    )
+                    q.enqueue_head(entry)
+                    self._observe("enq", qname, entry)
                 except Exception:
                     log.exception(
                         "qworker:%s#%d process raised on entry %r",
@@ -257,4 +284,10 @@ class WorkerSystem:
             log.info("qworker:%s#%d exited", qname, index)
 
 
-__all__ = ["WorkerSystem", "ProcessFn", "ObserverFn", "LoggerObserver"]
+__all__ = [
+    "LoggerObserver",
+    "ObserverFn",
+    "ProcessFn",
+    "TransientException",
+    "WorkerSystem",
+]

@@ -100,19 +100,40 @@ re-checking the stop flag.
 
 ## Error handling
 
-If `process(entry, conn)` raises (or the returned qname isn't in the
-registry — a `KeyError` from `registry.get`), the worker logs the
-exception and routes the entry to the configured `error_queue`. The
-worker then continues to the next item.
+Two distinct failure paths:
 
-`error_queue` must be pre-registered in the registry before
-`WorkerSystem` is constructed — the constructor raises `ValueError`
-if it isn't. Typically the consumer registers it with its own
-projection so error entries are recoverable across restarts.
+**Transient (retryable):** raise `TransientException` from inside
+`process`. The worker catches it specifically, re-enqueues the entry
+at the **head** of its source queue, and continues. The next dequeue
+on that queue picks the entry up immediately. `error_queue` is NOT
+involved. Use this for conditions where the same input is expected to
+succeed on a subsequent attempt — DB busy, network blip, rate-limited
+downstream, lock contention.
 
-If `error_queue` is `None`, exceptions are logged and the entry is
-dropped from this run (the observer sees a "drop" event); recovery
-happens at the next process restart via `populate()`.
+```python
+from qworkers import TransientException
+
+def process(entry, conn):
+    try:
+        do_work(entry, conn)
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e):
+            raise TransientException("retry on lock") from e
+        raise
+    return "next"
+```
+
+**Permanent:** any other exception (or a `KeyError` from a
+returned-but-unregistered qname) routes the entry to the configured
+`error_queue` and the worker continues. `error_queue` must be
+pre-registered in the registry before `WorkerSystem` is constructed —
+the constructor raises `ValueError` otherwise. Typically the consumer
+registers it with its own projection so error entries are recoverable
+across restarts.
+
+If `error_queue` is `None`, permanent exceptions are logged and the
+entry is dropped from this run (the observer sees a "drop" event);
+recovery happens at the next process restart via `populate()`.
 
 Process functions must be idempotent: running them twice with the
 same `entry` must produce the same final state.

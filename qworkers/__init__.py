@@ -3,7 +3,13 @@ per-queue process function.
 
 Public surface:
 
-    from qworkers import WorkerSystem, ProcessFn, ObserverFn, LoggerObserver
+    from qworkers import (
+        WorkerSystem,
+        ProcessFn,
+        ObserverFn,
+        LoggerObserver,
+        TransientException,
+    )
 
 Composes with `queuing`: takes a list of `(qname, process_fn)` pairs
 plus an optional pre-built `QueueRegistry`, spawns one daemon thread
@@ -12,6 +18,18 @@ new item arrives, `wake()` is called, or the stop signal fires.
 
 See README.md for usage; worker.py for the implementation.
 """
-from .worker import LoggerObserver, ObserverFn, ProcessFn, WorkerSystem
+from .worker import (
+    LoggerObserver,
+    ObserverFn,
+    ProcessFn,
+    TransientException,
+    WorkerSystem,
+)
 
-__all__ = ["LoggerObserver", "ObserverFn", "ProcessFn", "WorkerSystem"]
+__all__ = [
+    "LoggerObserver",
+    "ObserverFn",
+    "ProcessFn",
+    "TransientException",
+    "WorkerSystem",
+]
