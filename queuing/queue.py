@@ -34,12 +34,49 @@ that wraps Redis Streams / NATS JetStream / RabbitMQ behind the same
 """
 from __future__ import annotations
 
+import re
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
+
+# Identifier validator for table/column names that get interpolated into
+# SQL. SQLite has no `?` binding for identifiers, so the only safe way to
+# accept a user-supplied table or column name is to enforce a strict
+# allowlist regex before string-formatting it into the query.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_ident(value: str, label: str) -> str:
+    if not isinstance(value, str) or not _IDENT_RE.match(value):
+        raise ValueError(
+            f"invalid SQL identifier for {label}: {value!r} "
+            "(must match /^[A-Za-z_][A-Za-z0-9_]*$/)"
+        )
+    return value
+
+
+def _coerce_conn_or_factory(conn_or_factory: Any) -> Callable[[], Any]:
+    """Normalize a connection-or-factory argument to a zero-arg callable
+    that returns a DB-API connection.
+
+    `callable()` is the wrong predicate for distinguishing the two —
+    sqlite3.Connection is itself callable (it aliases to .cursor()) —
+    so we detect connections by the presence of `.execute`.
+    """
+    if hasattr(conn_or_factory, "execute"):
+        _conn = conn_or_factory
+        def get_conn():
+            return _conn
+        return get_conn
+    if callable(conn_or_factory):
+        return conn_or_factory
+    raise TypeError(
+        f"expected a DB-API connection or zero-arg callable returning one, "
+        f"got {type(conn_or_factory).__name__}"
+    )
 
 
 # ---------------------------- Queue ----------------------------------- #
@@ -232,6 +269,119 @@ class QueueRegistry:
         with self._lock:
             queues = list(self._queues.items())
         return {name: len(q) for name, q in queues}
+
+    def register_from_table(
+        self,
+        conn_or_factory: Any,
+        table: str,
+        queue_names: Iterable[str],
+        *,
+        q_column: str = "q_name",
+        id_column: str = "id",
+        where_extra: str | None = None,
+    ) -> list[Queue]:
+        """Register one Queue per name in `queue_names`, each backed by a
+        projection over `table`. The projection per queue X is:
+
+            SELECT <id_column> FROM <table>
+            WHERE <q_column> = 'X' [AND <where_extra>]
+
+        This factory does NOT verify the table is free of orphan q values
+        at construction time — that check is brittle at init (the table
+        might not exist yet, might be empty, or might carry pre-existing
+        rows from a retired queue name that would block startup). The
+        integrity property the consumer actually wants — that new writes
+        can only target registered queues — is enforced by
+        `QueueRegistry.get()` raising KeyError on unknown names; workers
+        can only enqueue to queues they obtained through `get()`.
+
+        For forensic detection of pre-existing orphans, call
+        `detect_orphans()` separately whenever it makes sense (after
+        migration, in a maintenance task, periodically). That decouples
+        init from data inspection.
+
+        `conn_or_factory` is either a DB-API connection (reused for every
+        projection call) or a zero-arg callable returning one (use the
+        callable form when projections run in worker threads with
+        per-thread connections).
+
+        `where_extra` is appended verbatim to the WHERE clause —
+        consumers are responsible for the SQL safety of anything they
+        pass in.
+
+        Returns the list of Queue instances registered, in `queue_names`
+        order. Idempotent against previously-registered names (the
+        existing Queue is returned and reused).
+        """
+        _validate_ident(table, "table")
+        _validate_ident(q_column, "q_column")
+        _validate_ident(id_column, "id_column")
+
+        names = list(queue_names)
+        if not names:
+            raise ValueError("queue_names must be non-empty")
+        for n in names:
+            if not isinstance(n, str) or not n:
+                raise ValueError(
+                    f"queue name must be a non-empty string, got {n!r}"
+                )
+
+        get_conn = _coerce_conn_or_factory(conn_or_factory)
+
+        sql = f"SELECT {id_column} FROM {table} WHERE {q_column} = ?"
+        if where_extra:
+            sql = f"{sql} AND ({where_extra})"
+
+        registered: list[Queue] = []
+        for name in names:
+            def make_projection(qn: str) -> Callable[[], list]:
+                # Late-binding guard: capture `qn` as a default arg so
+                # each closure binds the right queue name.
+                def projection(_qn=qn):
+                    return [row[0] for row in get_conn().execute(sql, (_qn,))]
+                return projection
+            q = self.register(name, projection=make_projection(name))
+            registered.append(q)
+        return registered
+
+    def detect_orphans(
+        self,
+        conn_or_factory: Any,
+        table: str,
+        *,
+        q_column: str = "q_name",
+    ) -> list[str]:
+        """Return the list of `<q_column>` values present in `table` that
+        are not registered in this registry. NULL q values are ignored
+        (rows with q_column IS NULL are not on any queue, which is a
+        valid terminal state).
+
+        Call this whenever the consuming app wants to verify data
+        integrity — after schema migration, in a maintenance task, as a
+        periodic sweep. Does NOT raise on orphans; returns them so the
+        caller decides what to do (log, alert, delete, migrate, ignore).
+
+        Returns an empty list when the table is empty or contains only
+        registered q values. Raises whatever the DB driver raises if the
+        table doesn't exist — call this AFTER ensuring the schema is in
+        place.
+        """
+        _validate_ident(table, "table")
+        _validate_ident(q_column, "q_column")
+
+        get_conn = _coerce_conn_or_factory(conn_or_factory)
+
+        with self._lock:
+            registered = set(self._queues)
+
+        found = {
+            row[0]
+            for row in get_conn().execute(
+                f"SELECT DISTINCT {q_column} FROM {table} "
+                f"WHERE {q_column} IS NOT NULL"
+            )
+        }
+        return sorted(found - registered)
 
 
 # ---------------------------- Public API ------------------------------ #

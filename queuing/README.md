@@ -128,6 +128,65 @@ For multi-process workers, you need a real broker. The `Queue` interface
 is small enough to port — `enqueue`, `dequeue`, `repopulate` — behind
 Redis Streams / NATS JetStream / RabbitMQ.
 
+## Factory: build a registry from a queue-shaped table
+
+When your durable queue state lives in a table with a `q_name` column
+(one row per queue item, queue assignment in `q_name`), the
+`register_from_table` factory builds projections for every named queue
+in one call:
+
+```python
+import sqlite3
+from queuing import QueueRegistry
+
+conn = sqlite3.connect("yourapp.db")
+
+reg = QueueRegistry()
+reg.register_from_table(
+    conn,
+    table="q_item",
+    queue_names=["categorize", "request", "plan", "research"],
+    q_column="q_name",          # default
+    id_column="payload",         # what to dequeue: instruction_id, task_id, …
+    where_extra=None,            # optional SQL appended to WHERE
+)
+
+reg.repopulate_all()
+queue = reg.get("categorize")    # raises KeyError if unregistered
+```
+
+Each queue's projection is `SELECT <id_column> FROM <table> WHERE
+<q_column> = 'X' [AND <where_extra>]`. Items move between queues by
+the consumer's worker doing `UPDATE <table> SET <q_column>='<next>'
+WHERE …` in its own transaction — that commit IS the dequeue+enqueue.
+
+## Integrity: write-time vs forensic
+
+The factory does **not** check for orphan `q_name` values at
+registration time. That check is brittle at init — the table may not
+exist yet, may be empty (vacuous), or may carry pre-existing rows from
+a retired queue name that would block startup.
+
+Two layers handle integrity instead:
+
+**Write-time, by construction.** `QueueRegistry.get(name)` raises
+`KeyError` for unregistered names. Workers only enqueue to queues they
+obtained through `get()`, so they cannot push to an unknown `q_name`.
+Bad values can't enter the system through the supported API.
+
+**Forensic, when the consumer is ready.** Call `detect_orphans` as a
+maintenance task (after schema migration, in a cron sweep, on operator
+demand):
+
+```python
+orphans = reg.detect_orphans(conn, "q_item")
+if orphans:
+    log.warning("orphan q_name values in q_item: %s", orphans)
+```
+
+It returns the list of `q_name` values present in the table but not
+registered. Decide what to do — log, alert, delete, migrate, ignore.
+
 ## API reference
 
 ```python
@@ -145,10 +204,20 @@ class Queue:
 
 class QueueRegistry:
     def register(name: str, projection: Callable | None = None) -> Queue
-    def get(name: str) -> Queue
+    def get(name: str) -> Queue                  # KeyError on unknown name
     def names() -> list[str]
     def repopulate_all() -> dict[str, int]
     def depths() -> dict[str, int]
+
+    # Factory + diagnostic for q_name-column tables:
+    def register_from_table(
+        conn_or_factory, table: str, queue_names: Iterable[str], *,
+        q_column: str = "q_name", id_column: str = "id",
+        where_extra: str | None = None,
+    ) -> list[Queue]
+    def detect_orphans(
+        conn_or_factory, table: str, *, q_column: str = "q_name",
+    ) -> list[str]
 ```
 
 ## What goes on the consumer's tables
