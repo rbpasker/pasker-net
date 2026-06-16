@@ -275,13 +275,14 @@ class WorkerSystem:
                         "qworker:%s#%d process raised on entry %r",
                         qname, index, entry,
                     )
-                    if self._error_queue is not None:
-                        self._registry.get(self._error_queue).enqueue(entry)
-                        self._observe("enq", self._error_queue, entry)
-                    else:
-                        # log and drop; recovery at next process restart
-                        # via populate().
-                        self._observe("drop", qname, entry)
+                    if self._error_queue is None:
+                        raise RuntimeError(
+                            f"qworker:{qname}#{index}: process raised and no "
+                            f"error_queue is configured; refusing to drop "
+                            f"entry {entry!r}"
+                        )
+                    self._registry.get(self._error_queue).enqueue(entry)
+                    self._observe("enq", self._error_queue, entry)
         finally:
             if conn is not None and hasattr(conn, "close"):
                 try:
