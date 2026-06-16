@@ -1,163 +1,132 @@
 # queuing
 
-SQL-backed named FIFO queues that live in the caller's database and ride
-on the caller's transactions. The queue's state changes commit (or roll
-back) atomically with whatever durable writes the worker is making —
-no drift between "the queue says done" and "the audit says done."
+In-memory named FIFO queues whose contents are derived from a projection
+of the consumer's durable state. The library holds no on-disk state of
+its own — your audit tables are the source of truth, and the in-memory
+deque is a working cache that can be lost and rebuilt at any time from
+the projection.
 
-## Use case
+## When this fits
 
 You have a pipeline (or multi-task workflow) whose stages or executors
-talk to each other by handing instructions/tasks/whatever-payload through
-named queues. You want:
+talk to each other by handing payloads (IDs, references) through named
+queues. You want:
 
-- the queue's state to be a SQL row, not an in-memory deque that vanishes
-  on restart;
-- queue mutations to be **transactional with the worker's other writes**
-  in the same database — no broker hop, no two-phase commit;
-- adding a new queue to cost zero schema migrations;
-- self-healing from a **projection** of your durable state, so a wiped
-  queue can be re-derived from the audit at boot.
+- **Single-process, multi-thread workers** competing for items on the
+  same queue. The deque's lock gives you atomic dequeue for free.
+- **Crash recovery without locks or visibility timeouts.** If a worker
+  dies mid-work, the audit row it was about to write was never committed,
+  so on restart the projection re-derives the same item. The library
+  doesn't track in-flight state and doesn't need to.
+- **Adding a queue to cost zero.** Register a name, optionally pass a
+  projection; the queue exists.
+- **Boot recovery and self-heal** by calling the same projection callable
+  the queue was constructed with.
 
-This library does all four. What it is not: a real broker. There is no
-cross-process delivery, no acks that survive an OS-level restart of the
-consuming process, no built-in retry policy. If you outgrow this, the
-`Queue` interface is small enough to port behind Redis Streams / NATS
-JetStream / RabbitMQ without touching consumer code.
+What this is NOT: a broker. Single-process only. There is no peek/ack/
+nack, no cross-restart visibility, no built-in retry policy. If you
+outgrow this, the `Queue` interface is small enough to port behind Redis
+Streams / NATS JetStream / RabbitMQ — consumer code doesn't change.
 
-## Schema
+## Why no peek/ack model
 
-One table, one partial index. Install at boot:
+Real brokers need peek/ack because the broker is the only thing that
+knows whether a worker actually finished. In this library, the
+**consumer's transaction** is what advances the durable state, and the
+absence of a committed audit row is the "this item still needs work"
+signal. The library doesn't need its own ack — the projection reads the
+audit and re-derives "what's still queued" from scratch.
 
-```python
-import sqlite3
-from queuing import install_schema
+Failure modes:
 
-conn = sqlite3.connect("yourapp.db")
-install_schema(conn)
-conn.commit()
-```
+| where the worker dies | on-disk state | recovery |
+|---|---|---|
+| dequeued, then died before any SQL | unchanged | projection sees the upstream still points here; re-enqueues |
+| committed, then died before `enqueue()` to next queue | next-stage row exists with `q='<next>'` | projection of the next queue picks up the orphan |
+| transaction itself raised and rolled back | unchanged | same as the first case |
 
-The table:
-
-```sql
-CREATE TABLE q_item (
-    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-    q          TEXT NOT NULL,
-    payload    TEXT NOT NULL,
-    locked_at  TEXT,                          -- NULL = visible
-    UNIQUE(q, payload)
-);
-CREATE INDEX q_item_visible ON q_item(q, seq) WHERE locked_at IS NULL;
-```
-
-All queues share this table. The `q` column discriminates rows; `seq` is
-a global AUTOINCREMENT so monotonic ordering across queues works for
-diagnostics ("the categorize push happened before the dispatch push").
-`payload` is opaque text — the consuming app interprets it (instruction
-UUID, task ID, JSON blob, whatever).
+In every case, the in-memory loss is irrelevant. The on-disk state is
+authoritative; the projection regenerates the cache.
 
 ## Worker pattern
 
-Every queue method takes the caller's connection. Wrap the peek + work +
-ack in a single transaction; commit on success, let the rollback handle
-crashes:
-
 ```python
 import sqlite3
-from queuing import Queue
+from queuing import QueueRegistry
 
-q = Queue("categorize")
+reg = QueueRegistry()
 
-with sqlite3.connect("yourapp.db") as conn:    # SQLite transaction
-    payload = q.peek(conn)                     # SELECT + UPDATE locked_at
-    if payload is None:
-        return                                 # queue empty
-    do_work(payload, conn)                     # writes durable audit/state
-    q.ack(conn, payload)                       # DELETE
-# commit fires here; queue mutation + audit writes are atomic
-```
-
-If `do_work` raises, the `with` block rolls back — `locked_at` is undone,
-the audit writes are undone, the queue row is back to visible. The next
-worker peeks it. No special recovery path needed.
-
-For multi-writer SQLite deployments, open the worker's transaction with
-`BEGIN IMMEDIATE` rather than the default `BEGIN DEFERRED`, so that the
-peek's SELECT+UPDATE pair serializes correctly against other peekers.
-
-## Producer pattern
-
-A worker that just finished its work for one queue often needs to push
-the payload onto the next queue. Same transaction:
-
-```python
-with sqlite3.connect("yourapp.db") as conn:
-    payload = q_in.peek(conn)
-    if payload is None:
-        return
-    do_work(payload, conn)
-    q_in.ack(conn, payload)
-    q_out.push(conn, payload)
-# all four operations commit together
-```
-
-If anything raises, all four roll back — no half-consumed item, no
-orphan in the next queue.
-
-## Projection pattern (boot recovery, self-heal)
-
-At boot, the in-memory broker is empty but the consuming app's durable
-audit tables already know what should be queued. Recover with a
-projection callable that derives "items that should be on this queue
-right now" from the audit:
-
-```python
 def categorize_projection(conn=conn):
-    return [
-        row[0] for row in conn.execute("""
-            SELECT s.instruction_id
-            FROM stages s
-            LEFT JOIN stages t
-              ON t.instruction_id = s.instruction_id AND t.stage_name = 'categorize'
-            WHERE s.next = 'categorize' AND t.instruction_id IS NULL
-        """)
-    ]
+    return [row[0] for row in conn.execute(
+        "SELECT s.instruction_id FROM stages s "
+        "LEFT JOIN stages t "
+        "  ON t.instruction_id = s.instruction_id AND t.stage_name='categorize' "
+        "WHERE s.q = 'categorize' AND t.instruction_id IS NULL"
+    )]
 
-q = Queue("categorize")
-with sqlite3.connect("yourapp.db") as conn:
-    q.repopulate(conn, categorize_projection, clear_stale_locks=True)
+reg.register("categorize", projection=categorize_projection)
+reg.register("request",    projection=request_projection)
+
+# Boot recovery — rebuild every queue's deque from durable state.
+reg.repopulate_all()
+
+# Worker thread for the categorize queue:
+q_in  = reg.get("categorize")
+q_out = reg.get("request")
+
+while not should_stop:
+    payload = q_in.dequeue()
+    if payload is None:
+        time.sleep(POLL_INTERVAL)
+        continue
+    try:
+        conn = sqlite3.connect("yourapp.db", isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")
+        do_categorize(payload, conn)           # writes stages.categorize row with q='request'
+        conn.commit()
+        q_out.enqueue(payload)                  # latency notification only
+    except Exception:
+        log.exception("worker failed; projection sweep will recover")
+        # No need to re-enqueue manually — the rollback left the on-disk
+        # state untouched, so the next reproject of this queue picks it up.
 ```
 
-`clear_stale_locks=True` is correct *only at boot* — it assumes no
-in-flight work is alive. NEVER pass it during steady-state operation; it
-will yank items out from under live workers.
+Note that `q_out.enqueue(payload)` runs AFTER `conn.commit()`. If it
+runs before commit, a rollback would leave a phantom item in the next
+queue's deque. Always commit first; enqueue is a notification.
 
-The same `repopulate` call (without `clear_stale_locks`) can run as a
-background self-heal sweep, patching up items the projection says should
-be queued but somehow aren't. It's a no-op when nothing has drifted.
+## At-least-once and idempotency
 
-## Inspection
+The library delivers **at least once**. A worker that crashes between
+dequeue and commit will have its item redelivered by the next projection
+sweep. Workers must be idempotent: running them twice with the same
+payload must be safe. This is the same discipline real audit pipelines
+already follow (ON CONFLICT on stage rows, monotonic state machines on
+tasks, etc.) — the library doesn't add any new requirement.
 
-Cheap dashboards:
+Duplicate-work window: if `repopulate()` runs while a worker is in the
+middle of processing an item, the projection (reading the not-yet-
+committed on-disk state) may re-add that item to the queue, and a second
+worker may dequeue it. Both workers will then race; the first to commit
+wins (the second's ON CONFLICT or status-check no-ops). To minimize the
+window, run `repopulate()` only at boot and at long intervals (minutes).
+Don't run it on every empty-queue tick.
 
-```python
-from queuing import queue_names, queue_depths
+## Multi-thread workers
 
-queue_names(conn)
-# ["categorize", "research", "evaluation"]
+A single Queue object supports N worker threads pulling from it
+concurrently. Each `dequeue()` is atomic (a `threading.Lock` guards the
+deque); two threads can't see the same payload. Run as many threads as
+your DB can handle concurrent writes against (for SQLite, that's
+typically one writer + many readers, so the bottleneck is at the DB
+layer, not the queue).
 
-queue_depths(conn)
-# {"categorize": {"pending": 3, "inflight": 0},
-#  "research":   {"pending": 0, "inflight": 1},
-#  "evaluation": {"pending": 5, "inflight": 0}}
-```
+For executor pools (e.g., N research-agent workers competing on the
+"research" queue), this is the native shape.
 
-Per-queue snapshot (diagnostics only — don't drive control flow with it):
-
-```python
-pending, inflight = Queue("categorize").snapshot(conn)
-```
+For multi-process workers, you need a real broker. The `Queue` interface
+is small enough to port — `enqueue`, `dequeue`, `repopulate` — behind
+Redis Streams / NATS JetStream / RabbitMQ.
 
 ## API reference
 
@@ -165,22 +134,68 @@ pending, inflight = Queue("categorize").snapshot(conn)
 class Queue:
     name: str
 
-    def push(conn, payload: str) -> bool
-    def extend(conn, payloads: Iterable[str]) -> int
-    def peek(conn) -> str | None
-    def ack(conn, payload: str) -> bool
-    def nack(conn, payload: str) -> bool
-    def repopulate(conn, projection: Callable[[], Iterable[str]],
-                   *, clear_stale_locks: bool = False) -> int
-    def pending_count(conn) -> int
-    def inflight_count(conn) -> int
-    def snapshot(conn) -> tuple[list[str], list[tuple[str, str]]]
+    def __init__(name: str,
+                 projection: Callable[[], Iterable] | None = None)
+    def enqueue(item) -> bool
+    def extend(items: Iterable) -> int
+    def dequeue() -> item | None
+    def repopulate(projection: Callable | None = None) -> int
+    def snapshot() -> list
+    def __len__() -> int
 
-SCHEMA_DDL: tuple[str, ...]
-def install_schema(conn) -> None
-def queue_names(conn) -> list[str]
-def queue_depths(conn) -> dict[str, dict[str, int]]
+class QueueRegistry:
+    def register(name: str, projection: Callable | None = None) -> Queue
+    def get(name: str) -> Queue
+    def names() -> list[str]
+    def repopulate_all() -> dict[str, int]
+    def depths() -> dict[str, int]
 ```
+
+## What goes on the consumer's tables
+
+Because this library holds no SQL state, the consumer's tables carry the
+queue assignment. The recommended shape:
+
+```sql
+-- on each audit row, record where the worker routed the item next:
+ALTER TABLE stages ADD COLUMN q TEXT;   -- the next queue this stage handed off to
+ALTER TABLE tasks  ADD COLUMN q TEXT;   -- the executor queue this task is in
+```
+
+The projection for queue `Y` then looks like:
+
+```sql
+SELECT s.instruction_id FROM stages s
+LEFT JOIN stages downstream
+       ON downstream.instruction_id = s.instruction_id
+      AND downstream.stage_name = 'Y'
+WHERE  s.q = 'Y'
+  AND  downstream.instruction_id IS NULL
+  AND  <instruction is not cancelled>
+ORDER BY s.seq
+```
+
+For executor queues over `tasks`:
+
+```sql
+SELECT t.id FROM tasks t
+JOIN   instructions i ON ...
+WHERE  t.q = 'Y' AND t.status NOT LIKE 'done:%'
+  AND  i.state != 'cancelled'
+ORDER BY t.seq
+```
+
+For the bootstrap queue (e.g., INGEST), there's no upstream stage row;
+project from the source table directly:
+
+```sql
+SELECT i.id FROM instructions i
+LEFT JOIN stages s ON s.instruction_id = i.id AND s.stage_name = 'ingest'
+WHERE s.instruction_id IS NULL AND i.state != 'cancelled'
+```
+
+The consumer writes its own projection callables and registers them; the
+library just runs them on demand.
 
 ## Use as a git submodule
 
@@ -191,12 +206,12 @@ git submodule add https://github.com/rbpasker/pasker-net.git vendor/pasker-net
 git submodule update --init
 ```
 
-Then add `vendor/pasker-net/` to `sys.path` early in your entrypoint, or
+Then add `vendor/pasker-net/` to `sys.path` early in the entrypoint, or
 symlink the `queuing/` directory under your project.
 
 ```python
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "vendor" / "pasker-net"))
-from queuing import Queue, install_schema
+from queuing import Queue, QueueRegistry
 ```

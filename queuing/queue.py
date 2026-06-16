@@ -1,312 +1,239 @@
-"""SQL-backed named FIFO queues that share the consuming app's database
-and the consuming app's transactions.
+"""In-memory named FIFO queues whose contents are derived from a
+projection of the consuming app's durable state.
 
 Design — three properties carry the abstraction:
 
-1. **One table, all queues.** Items live in a single `q_item` table
-   discriminated by the `q` column. Adding a queue costs zero DDL — the
-   first `push` with a new `q` value is the queue's birth certificate.
-   `SELECT q, COUNT(*) FROM q_item GROUP BY q` is the registry.
+1. **The queue is in-memory.** Just a `deque` per named queue. No backing
+   table, no broker hop, no serialization tax. Enqueue and dequeue happen
+   at Python speed.
 
-2. **Every method takes the caller's connection.** The queue's INSERTs,
-   UPDATEs, and DELETEs happen on the connection the caller passes in,
-   inside whatever transaction the caller has open. The worker pattern is:
+2. **The on-disk source of truth is the consuming app's own audit
+   tables.** Each queue is constructed with a `projection` callable that
+   returns "what should be on this queue right now" by inspecting the
+   durable state of the consumer (typically a SQL query over its existing
+   rows). The library never owns a row; the consumer's tables are the
+   truth.
 
-       with conn:                                 # SQLite txn
-           payload = q.peek(conn)                 # SELECT + UPDATE locked_at
-           if payload is None: return
-           do_work(payload, conn)                 # worker writes audit/state
-           q.ack(conn, payload)                   # DELETE
-       # commit fires here; queue mutation + worker writes are atomic
+3. **At-least-once delivery from automatic recovery.** Workers dequeue
+   items, do their work inside a database transaction that advances the
+   audit state (writing the next-stage row, advancing task status,
+   whatever), and commit. On commit, the worker enqueues the payload to
+   the next queue's in-memory deque as a latency-saving notification.
+   If anything fails between dequeue and commit, the on-disk state did
+   not move and the projection will re-derive the same item on its next
+   call. Workers must be idempotent — calling them twice with the same
+   payload must be safe — which matches the discipline real audit
+   pipelines already follow.
 
-   No drift possible between "queue says done" and "audit says done" —
-   either both committed or neither did.
-
-3. **The projection is the boot-recovery contract, not the runtime
-   contract.** At runtime, items move via push/peek/ack. At boot (or as a
-   background self-heal sweep), `repopulate(conn, projection=fn)` reads
-   the consuming app's durable audit state via `fn`, inserts anything the
-   projection says should be in the queue but isn't, and (optionally)
-   clears stale locks. The audit tables are the source of truth; the
-   queue is the working set.
-
-What this is NOT: a broker. There is no cross-process delivery, no
-across-restart visibility timeout, no built-in retry policy. If you need
-those, replace this library with one that wraps Redis Streams / NATS
-JetStream / RabbitMQ behind the same `Queue` interface — the consumer
-code does not change.
+What this is NOT: a broker. Single-process only — the in-memory deque is
+not shared across processes. There is no peek/ack/nack model and no
+queue-level lock; correctness comes from the consumer's transaction plus
+the projection. If you outgrow single-process, swap this library for one
+that wraps Redis Streams / NATS JetStream / RabbitMQ behind the same
+`Queue` interface; the consumer code does not change.
 """
 from __future__ import annotations
 
-import datetime as _dt
-import sqlite3
+import threading
+from collections import deque
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Generic, TypeVar
 
-
-# ---------------------------- DDL ------------------------------------- #
-
-SCHEMA_DDL = (
-    """
-    CREATE TABLE IF NOT EXISTS q_item (
-        seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-        q          TEXT NOT NULL,
-        payload    TEXT NOT NULL,
-        locked_at  TEXT,                          -- NULL = visible; ISO ts = taken
-        UNIQUE(q, payload)
-    );
-    """,
-    # Partial index over visible items only — the hot path for peek().
-    # WHERE locked_at IS NULL keeps the index small (locked rows excluded),
-    # so an empty queue is one B-tree leaf read.
-    """
-    CREATE INDEX IF NOT EXISTS q_item_visible
-        ON q_item(q, seq) WHERE locked_at IS NULL;
-    """,
-)
-
-
-def install_schema(conn: sqlite3.Connection) -> None:
-    """Create the q_item table and its index if they don't exist. Call
-    once at app startup. Idempotent; uses IF NOT EXISTS throughout."""
-    for stmt in SCHEMA_DDL:
-        conn.execute(stmt)
+T = TypeVar("T")
 
 
 # ---------------------------- Queue ----------------------------------- #
 
 
-def _now_iso() -> str:
-    """ISO 8601 UTC stamp, second precision. Used as the locked_at marker."""
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+class Queue(Generic[T]):
+    """A named in-memory FIFO queue. Items are opaque to the queue —
+    typically instruction IDs or task IDs that index rows in the
+    consumer's durable tables.
 
-
-class Queue:
-    """A named FIFO queue backed by the q_item table.
-
-    The queue object is a thin handle — it carries the queue name and
-    provides methods that operate on a caller-supplied connection. The
-    queue is cheap to construct (just stores the name); construct one
-    per logical queue at startup or inline at each use site.
+    Thread-safe within one process (a `threading.Lock` guards the deque).
+    NOT safe across processes — the deque lives in this process's heap.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        projection: Callable[[], Iterable[T]] | None = None,
+    ) -> None:
         if not name or not isinstance(name, str):
-            raise ValueError(f"queue name must be a non-empty string, got {name!r}")
+            raise ValueError(
+                f"queue name must be a non-empty string, got {name!r}"
+            )
         self.name = name
+        self._projection = projection
+        self._items: deque[T] = deque()
+        self._seen: set[T] = set()           # dedup against re-projection
+        self._lock = threading.Lock()
 
     # ----- producer side -------------------------------------------------
 
-    def push(self, conn: sqlite3.Connection, payload: str) -> bool:
-        """Insert `payload` at the tail of this queue. Idempotent against
-        duplicates (UNIQUE(q, payload) — re-pushing the same payload is a
-        no-op). Returns True if the row was inserted, False if it was
-        already present (visible or in-flight).
+    def enqueue(self, item: T) -> bool:
+        """Append `item` to the tail. Idempotent: enqueuing the same item
+        twice while it's still pending is a no-op. Returns True if the
+        item was added, False if it was already in the queue.
 
-        Participates in the caller's transaction: if the caller's
-        transaction rolls back, the push is undone."""
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO q_item (q, payload) VALUES (?, ?)",
-            (self.name, payload),
-        )
-        return cur.rowcount > 0
+        Call AFTER the worker's transaction has committed — the on-disk
+        state already reflects the next-queue assignment; this is a
+        latency-saving notification to the in-memory deque."""
+        with self._lock:
+            if item in self._seen:
+                return False
+            self._items.append(item)
+            self._seen.add(item)
+            return True
 
-    def extend(self, conn: sqlite3.Connection, payloads: Iterable[str]) -> int:
-        """Bulk push. Returns the number of newly inserted rows (existing
-        ones are silently skipped via the UNIQUE constraint)."""
-        rows = [(self.name, p) for p in payloads]
-        if not rows:
-            return 0
-        cur = conn.executemany(
-            "INSERT OR IGNORE INTO q_item (q, payload) VALUES (?, ?)",
-            rows,
-        )
-        return cur.rowcount
+    def extend(self, items: Iterable[T]) -> int:
+        """Bulk enqueue. Returns the number of newly added items
+        (duplicates against the current pending set are skipped)."""
+        added = 0
+        with self._lock:
+            for item in items:
+                if item in self._seen:
+                    continue
+                self._items.append(item)
+                self._seen.add(item)
+                added += 1
+        return added
 
     # ----- consumer side -------------------------------------------------
 
-    def peek(self, conn: sqlite3.Connection) -> str | None:
-        """Take the oldest visible item and mark it in-flight by setting
-        `locked_at` to now. Returns the payload or None if the queue is
-        empty.
+    def dequeue(self) -> T | None:
+        """Pop the oldest item. Returns None if the queue is empty.
 
-        Participates in the caller's transaction. If the caller's
-        transaction commits, the lock persists across the gap until
-        ack/nack. If it rolls back (worker crashed, exception was raised),
-        the lock disappears with the rollback and the item is immediately
-        visible to the next peek.
+        The dequeue is atomic within this process. The item leaves the
+        in-memory queue immediately and the worker takes responsibility
+        for advancing the on-disk audit state in a transaction. If the
+        worker fails before the audit commits, the on-disk state is
+        unchanged and the projection will re-derive the item on the next
+        `repopulate()` — at-least-once delivery."""
+        with self._lock:
+            if not self._items:
+                return None
+            item = self._items.popleft()
+            self._seen.discard(item)
+            return item
 
-        For SQLite multi-writer correctness, the caller's transaction
-        should be opened with `BEGIN IMMEDIATE` so the SELECT + UPDATE
-        pair serializes correctly against concurrent peekers. With
-        deferred BEGIN, two peekers could both read the same row before
-        either UPDATEs."""
-        row = conn.execute(
-            "SELECT seq, payload FROM q_item "
-            "WHERE q = ? AND locked_at IS NULL "
-            "ORDER BY seq LIMIT 1",
-            (self.name,),
-        ).fetchone()
-        if row is None:
-            return None
-        seq, payload = row
-        conn.execute(
-            "UPDATE q_item SET locked_at = ? WHERE seq = ?",
-            (_now_iso(), seq),
-        )
-        return payload
-
-    def ack(self, conn: sqlite3.Connection, payload: str) -> bool:
-        """Confirm work is done — delete the row. Returns True if the
-        row was present, False if it was already gone (idempotent).
-
-        Participates in the caller's transaction: the delete commits or
-        rolls back with the worker's other writes."""
-        cur = conn.execute(
-            "DELETE FROM q_item WHERE q = ? AND payload = ?",
-            (self.name, payload),
-        )
-        return cur.rowcount > 0
-
-    def nack(self, conn: sqlite3.Connection, payload: str) -> bool:
-        """Release the lock without consuming — item becomes visible
-        again. Use when the worker decided not to handle this item (not
-        when the worker crashed; rollback handles that automatically).
-
-        Returns True if a locked row was released, False otherwise."""
-        cur = conn.execute(
-            "UPDATE q_item SET locked_at = NULL "
-            "WHERE q = ? AND payload = ? AND locked_at IS NOT NULL",
-            (self.name, payload),
-        )
-        return cur.rowcount > 0
-
-    # ----- projection / self-heal ----------------------------------------
+    # ----- projection / recovery -----------------------------------------
 
     def repopulate(
         self,
-        conn: sqlite3.Connection,
-        projection: Callable[[], Iterable[str]],
-        *,
-        clear_stale_locks: bool = False,
+        projection: Callable[[], Iterable[T]] | None = None,
     ) -> int:
-        """Run a projection callable and insert any items it returns that
-        are not already in this queue (visible or locked).
+        """Run the projection callable and enqueue any items it returns
+        that are not already in the queue. Returns the number of items
+        added.
 
-        Use at boot to derive queue contents from the consuming app's
-        durable audit state. Run periodically as a self-heal sweep to
-        patch up any items the projection says should be queued but
-        aren't (e.g., a worker crashed before pushing the next item,
-        leaving the audit committed but the next queue empty).
+        Use at boot to derive queue contents from the consumer's audit
+        state. Run periodically as a self-heal sweep to patch up any
+        items the projection says should be queued but aren't (e.g., a
+        worker died between commit and in-memory enqueue, or the process
+        restarted).
 
-        `clear_stale_locks=True` additionally clears `locked_at` on every
-        row of this queue — use only at boot, when no in-flight work can
-        possibly be alive. NEVER set this true during steady-state
-        operation; it will yank items out from under live workers.
-
-        Returns the number of items inserted by this call.
-
-        Participates in the caller's transaction."""
-        if clear_stale_locks:
-            conn.execute(
-                "UPDATE q_item SET locked_at = NULL WHERE q = ?",
-                (self.name,),
+        If `projection` is omitted, the projection passed to `__init__`
+        is used. Calling without either raises ValueError."""
+        proj = projection or self._projection
+        if proj is None:
+            raise ValueError(
+                f"queue {self.name!r} has no projection — pass one to "
+                "__init__ or to repopulate()"
             )
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT payload FROM q_item WHERE q = ?",
-                (self.name,),
-            )
-        }
-        new_rows = [
-            (self.name, item)
-            for item in projection()
-            if item not in existing
-        ]
-        if not new_rows:
-            return 0
-        cur = conn.executemany(
-            "INSERT OR IGNORE INTO q_item (q, payload) VALUES (?, ?)",
-            new_rows,
-        )
-        return cur.rowcount
+        # Materialize the projection results OUTSIDE the lock — the
+        # callable typically runs a SQL query that may take milliseconds
+        # to seconds, and we don't want to block dequeues during it.
+        items = list(proj())
+        added = 0
+        with self._lock:
+            for item in items:
+                if item in self._seen:
+                    continue
+                self._items.append(item)
+                self._seen.add(item)
+                added += 1
+        return added
 
     # ----- inspection ----------------------------------------------------
 
-    def pending_count(self, conn: sqlite3.Connection) -> int:
-        """Number of visible (unlocked) items waiting on this queue."""
-        return conn.execute(
-            "SELECT COUNT(*) FROM q_item WHERE q = ? AND locked_at IS NULL",
-            (self.name,),
-        ).fetchone()[0]
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
 
-    def inflight_count(self, conn: sqlite3.Connection) -> int:
-        """Number of items currently locked (in-flight)."""
-        return conn.execute(
-            "SELECT COUNT(*) FROM q_item WHERE q = ? AND locked_at IS NOT NULL",
-            (self.name,),
-        ).fetchone()[0]
-
-    def snapshot(
-        self, conn: sqlite3.Connection,
-    ) -> tuple[list[str], list[tuple[str, str]]]:
-        """Return (pending_payloads, inflight_payloads_with_lock_time).
-        For dashboards / diagnostics only; do not use to drive control
-        flow. Each return is a freshly built list — caller may mutate
-        without affecting database state."""
-        pending = [
-            row[0]
-            for row in conn.execute(
-                "SELECT payload FROM q_item "
-                "WHERE q = ? AND locked_at IS NULL ORDER BY seq",
-                (self.name,),
-            )
-        ]
-        inflight = [
-            (row[0], row[1])
-            for row in conn.execute(
-                "SELECT payload, locked_at FROM q_item "
-                "WHERE q = ? AND locked_at IS NOT NULL ORDER BY seq",
-                (self.name,),
-            )
-        ]
-        return pending, inflight
+    def snapshot(self) -> list[T]:
+        """Return a fresh list of currently pending items, in FIFO order.
+        For dashboards and diagnostics only — do not use to drive control
+        flow. The caller may mutate the returned list without affecting
+        queue state."""
+        with self._lock:
+            return list(self._items)
 
 
 # ---------------------------- Registry -------------------------------- #
 
 
-def queue_names(conn: sqlite3.Connection) -> list[str]:
-    """Return every queue name that has at least one row right now.
-    Derived from the data; no separate registry table is maintained."""
-    return [
-        row[0]
-        for row in conn.execute("SELECT DISTINCT q FROM q_item ORDER BY q")
-    ]
+class QueueRegistry:
+    """A named collection of Queues, with bulk operations for boot and
+    self-heal. Use when the consuming system has a fixed set of named
+    queues (one per pipeline stage, one per executor):
 
+        reg = QueueRegistry()
+        reg.register("categorize", projection=lambda: db.find_ready_for("categorize"))
+        reg.register("request",    projection=lambda: db.find_ready_for("request"))
+        reg.register("research",   projection=lambda: db.find_pending_agent("research"))
+        reg.repopulate_all()
+    """
 
-def queue_depths(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
-    """One-shot overview: `{queue_name: {"pending": N, "inflight": M}}`
-    for every queue with any rows. Use in dashboards / health checks."""
-    out: dict[str, dict[str, int]] = {}
-    rows = conn.execute(
-        "SELECT q, "
-        "       SUM(CASE WHEN locked_at IS NULL THEN 1 ELSE 0 END) AS pending, "
-        "       SUM(CASE WHEN locked_at IS NOT NULL THEN 1 ELSE 0 END) AS inflight "
-        "FROM q_item GROUP BY q ORDER BY q"
-    )
-    for q, pending, inflight in rows:
-        out[q] = {"pending": int(pending or 0), "inflight": int(inflight or 0)}
-    return out
+    def __init__(self) -> None:
+        self._queues: dict[str, Queue] = {}
+        self._lock = threading.Lock()
+
+    def register(
+        self,
+        name: str,
+        projection: Callable[[], Iterable] | None = None,
+    ) -> Queue:
+        """Register a queue by name. If a queue with this name already
+        exists, return it (idempotent)."""
+        with self._lock:
+            if name in self._queues:
+                return self._queues[name]
+            q = Queue(name, projection=projection)
+            self._queues[name] = q
+            return q
+
+    def get(self, name: str) -> Queue:
+        """Return the queue registered under `name`. Raises KeyError if
+        not registered."""
+        with self._lock:
+            return self._queues[name]
+
+    def names(self) -> list[str]:
+        """All registered queue names, in registration order."""
+        with self._lock:
+            return list(self._queues)
+
+    def repopulate_all(self) -> dict[str, int]:
+        """Repopulate every queue that has a projection. Returns
+        `{queue_name: items_added}`. Queues without a projection are
+        skipped silently."""
+        with self._lock:
+            queues = list(self._queues.items())
+        out: dict[str, int] = {}
+        for name, q in queues:
+            if q._projection is None:
+                continue
+            out[name] = q.repopulate()
+        return out
+
+    def depths(self) -> dict[str, int]:
+        """`{queue_name: current_depth}` for every registered queue."""
+        with self._lock:
+            queues = list(self._queues.items())
+        return {name: len(q) for name, q in queues}
 
 
 # ---------------------------- Public API ------------------------------ #
 
-__all__ = [
-    "Queue",
-    "SCHEMA_DDL",
-    "install_schema",
-    "queue_names",
-    "queue_depths",
-]
+__all__ = ["Queue", "QueueRegistry"]
