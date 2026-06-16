@@ -111,11 +111,67 @@ if it isn't. Typically the consumer registers it with its own
 projection so error entries are recoverable across restarts.
 
 If `error_queue` is `None`, exceptions are logged and the entry is
-dropped from this run; recovery happens at the next process restart
-via `populate()`.
+dropped from this run (the observer sees a "drop" event); recovery
+happens at the next process restart via `populate()`.
 
 Process functions must be idempotent: running them twice with the
 same `entry` must produce the same final state.
+
+## Observability
+
+Pass an `observer` callable to the constructor to receive a callback
+for every worker-driven event:
+
+| event   | meaning                                                      |
+|---------|--------------------------------------------------------------|
+| `"deq"` | worker dequeued `item` from `qname`                          |
+| `"enq"` | worker enqueued `item` to `qname` (next-queue, fan-out, or error_queue) |
+| `"drop"`| `item` was dropped after process raised; no error_queue was set; `qname` is the source queue |
+
+Signature:
+
+```python
+ObserverFn = Callable[[str, str, Any], None]  # event, qname, item
+```
+
+`LoggerObserver` is a ready-made observer that logs each event via
+Python logging:
+
+```python
+from qworkers import LoggerObserver, WorkerSystem
+ws = WorkerSystem(..., observer=LoggerObserver())
+```
+
+Customize logger and level:
+
+```python
+ws = WorkerSystem(..., observer=LoggerObserver(
+    logger=logging.getLogger("myapp.queues"),
+    level=logging.DEBUG,
+))
+```
+
+Direct `Queue.enqueue` calls outside the worker loop (e.g., when a
+consumer seeds the pipeline) are NOT observed automatically — call the
+observer by hand at those sites if you want them logged.
+
+Observer exceptions are caught and logged; they never disrupt the
+worker.
+
+## Sample app
+
+`qworkers/tests/sample_app.py` runs an N-stage pipeline with M
+messages, random per-item work times (0.01–3.0 s), and a configurable
+per-stage failure probability:
+
+```bash
+python -m qworkers.tests.sample_app                                # 5 queues, 20 messages
+python -m qworkers.tests.sample_app -q 8 -m 50                     # 8 queues, 50 messages
+python -m qworkers.tests.sample_app -q 3 -m 5 --fail-prob 0.3
+```
+
+Output is a stream of enq/deq/drop events from `LoggerObserver` plus
+a final tally.
 
 ## API reference
 

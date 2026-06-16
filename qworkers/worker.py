@@ -14,6 +14,15 @@ every dequeued item.
   error_queue, the exception is logged and the entry is dropped;
   recovery happens at the next process restart via `Queue.populate()`.
   Process functions must be idempotent.
+- An optional `observer` callback receives `(event, qname, item)` for
+  every worker-driven event:
+    "deq"  — item was dequeued from `qname`
+    "enq"  — item was enqueued to `qname` (next-queue, fan-out, or
+             error_queue)
+    "drop" — item was dropped after a process exception because no
+             error_queue was configured; `qname` is the source queue
+  See `LoggerObserver` for a sample that logs each event via Python
+  logging.
 """
 from __future__ import annotations
 
@@ -33,6 +42,37 @@ log = logging.getLogger(__name__)
 ProcessFn = Callable[[Any, Any], "str | list[str] | None"]
 
 
+# An observer is called with (event, qname, item) for every worker-
+# driven enqueue or dequeue. event is "enq" or "deq".
+ObserverFn = Callable[[str, str, Any], None]
+
+
+class LoggerObserver:
+    """Sample observer: logs each enq/deq event via Python logging.
+
+    Usage:
+        ws = WorkerSystem(..., observer=LoggerObserver())
+
+    or with a specific logger / level:
+
+        ws = WorkerSystem(..., observer=LoggerObserver(
+            logger=logging.getLogger("myapp.queues"),
+            level=logging.DEBUG,
+        ))
+    """
+
+    def __init__(
+        self,
+        logger: logging.Logger | None = None,
+        level: int = logging.INFO,
+    ) -> None:
+        self._log = logger if logger is not None else logging.getLogger("qworkers")
+        self._level = level
+
+    def __call__(self, event: str, qname: str, item: Any) -> None:
+        self._log.log(self._level, "%s %s %r", event, qname, item)
+
+
 class WorkerSystem:
     """Run a thread per (qname, process) pair against a QueueRegistry.
 
@@ -49,6 +89,7 @@ class WorkerSystem:
         registry: QueueRegistry | None = None,
         conn_factory: Callable[[], Any] | None = None,
         error_queue: str | None = None,
+        observer: ObserverFn | None = None,
         wait_timeout: float = 1.0,
     ) -> None:
         """
@@ -67,6 +108,14 @@ class WorkerSystem:
                       checked at construction. If None, exceptions are
                       logged and the entry is dropped; recovery happens
                       at next process restart via Queue.populate().
+        observer:     optional callable invoked with (event, qname, item)
+                      for every worker-driven event: "deq" (dequeued
+                      from qname), "enq" (enqueued to qname), "drop"
+                      (item dropped after process raised and no
+                      error_queue is configured; qname is the source
+                      queue). See LoggerObserver. Exceptions in the
+                      observer are caught and logged; they don't disrupt
+                      worker flow.
         wait_timeout: how long a worker blocks in wait_for_item before
                       re-checking the stop flag.
         """
@@ -74,6 +123,7 @@ class WorkerSystem:
         self._registry = registry if registry is not None else QueueRegistry()
         self._conn_factory = conn_factory
         self._error_queue = error_queue
+        self._observer = observer
         self._wait_timeout = wait_timeout
 
         # Auto-register pair qnames. register is idempotent so this is
@@ -153,6 +203,16 @@ class WorkerSystem:
 
     # ----- worker loop --------------------------------------------------
 
+    def _observe(self, event: str, qname: str, item: Any) -> None:
+        """Fire the observer callback, isolating its exceptions so a
+        buggy observer can't break a worker."""
+        if self._observer is None:
+            return
+        try:
+            self._observer(event, qname, item)
+        except Exception:
+            log.exception("observer raised on %s %s %r", event, qname, item)
+
     def _worker_loop(self, qname: str, process: ProcessFn, index: int) -> None:
         q = self._registry.get(qname)
         conn = self._conn_factory() if self._conn_factory is not None else None
@@ -163,15 +223,18 @@ class WorkerSystem:
                 if entry is None:
                     q.wait_for_item(timeout=self._wait_timeout)
                     continue
+                self._observe("deq", qname, entry)
                 try:
                     result = process(entry, conn)
                     if isinstance(result, str):
                         self._registry.get(result).enqueue(entry)
+                        self._observe("enq", result, entry)
                     elif result is not None:
                         # list[str] — fan-out. Storage durability is the
                         # consumer's problem; the worker just enqueues.
                         for next_qname in result:
                             self._registry.get(next_qname).enqueue(entry)
+                            self._observe("enq", next_qname, entry)
                     # result is None → terminal; nothing to do.
                 except Exception:
                     log.exception(
@@ -180,8 +243,11 @@ class WorkerSystem:
                     )
                     if self._error_queue is not None:
                         self._registry.get(self._error_queue).enqueue(entry)
-                    # else: log and drop; recovery at next process
-                    # restart via populate().
+                        self._observe("enq", self._error_queue, entry)
+                    else:
+                        # log and drop; recovery at next process restart
+                        # via populate().
+                        self._observe("drop", qname, entry)
         finally:
             if conn is not None and hasattr(conn, "close"):
                 try:
@@ -191,4 +257,4 @@ class WorkerSystem:
             log.info("qworker:%s#%d exited", qname, index)
 
 
-__all__ = ["WorkerSystem", "ProcessFn"]
+__all__ = ["WorkerSystem", "ProcessFn", "ObserverFn", "LoggerObserver"]
