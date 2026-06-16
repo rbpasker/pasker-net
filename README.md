@@ -19,6 +19,11 @@ Shared utility modules for personal projects.
   callable at boot or as a self-heal sweep. Multi-thread native
   (single-process); the small `Queue` interface ports cleanly to a real
   broker when multi-process is needed. Stdlib only.
+- [`qworkers/`](qworkers/) — thread workers that loop on
+  `queuing.Queue` instances, one daemon thread per `(qname, process)`
+  pair. Blocks on `Queue.wait_for_item()` when idle (no polling),
+  supports worker pools by repeating pairs, and provides clean
+  start/stop/join lifecycle plus a context manager. Stdlib only.
 
 ## Use as a git submodule
 

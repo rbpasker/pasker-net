@@ -169,10 +169,22 @@ a retired queue name that would block startup.
 
 Two layers handle integrity instead:
 
-**Write-time, by construction.** `QueueRegistry.get(name)` raises
-`KeyError` for unregistered names. Workers only enqueue to queues they
-obtained through `get()`, so they cannot push to an unknown `q_name`.
-Bad values can't enter the system through the supported API.
+**Access-gated, by construction.** All queue interaction goes through
+`QueueRegistry.get(name)`, which raises `KeyError` for unregistered
+names. There is no other supported way to obtain a `Queue` handle —
+so workers can neither `enqueue()` to nor `dequeue()` from an
+unregistered queue. The flow is always:
+
+```python
+q = registry.get("categorize")    # KeyError if not registered
+payload = q.dequeue()
+# … work …
+registry.get("request").enqueue(payload)
+```
+
+Bad queue names fail loudly at the call site, before any I/O happens.
+The registry is the contract for which queues exist; nothing outside
+it can address a queue.
 
 **Forensic, when the consumer is ready.** Call `detect_orphans` as a
 maintenance task (after schema migration, in a cron sweep, on operator
@@ -196,8 +208,9 @@ class Queue:
     def __init__(name: str,
                  projection: Callable[[], Iterable] | None = None)
     def enqueue(item) -> bool
-    def extend(items: Iterable) -> int
     def dequeue() -> item | None
+    def wait_for_item(timeout: float | None = None) -> bool
+    def wake() -> None
     def repopulate(projection: Callable | None = None) -> int
     def snapshot() -> list
     def __len__() -> int

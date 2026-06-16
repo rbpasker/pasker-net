@@ -105,6 +105,11 @@ class Queue(Generic[T]):
         self._items: deque[T] = deque()
         self._seen: set[T] = set()           # dedup against re-projection
         self._lock = threading.Lock()
+        # Wake-up signal for blocked workers — set by enqueue. Sticky
+        # threading.Event: a set() before a wait() is not lost. Consumed
+        # by future worker harnesses that want to block on an empty queue
+        # rather than poll.
+        self._ready = threading.Event()
 
     # ----- producer side -------------------------------------------------
 
@@ -115,26 +120,17 @@ class Queue(Generic[T]):
 
         Call AFTER the worker's transaction has committed — the on-disk
         state already reflects the next-queue assignment; this is a
-        latency-saving notification to the in-memory deque."""
+        latency-saving notification to the in-memory deque.
+
+        Sets the wake-up event so any thread blocked in
+        `wait_for_item()` is unparked."""
         with self._lock:
             if item in self._seen:
                 return False
             self._items.append(item)
             self._seen.add(item)
-            return True
-
-    def extend(self, items: Iterable[T]) -> int:
-        """Bulk enqueue. Returns the number of newly added items
-        (duplicates against the current pending set are skipped)."""
-        added = 0
-        with self._lock:
-            for item in items:
-                if item in self._seen:
-                    continue
-                self._items.append(item)
-                self._seen.add(item)
-                added += 1
-        return added
+        self._ready.set()
+        return True
 
     # ----- consumer side -------------------------------------------------
 
@@ -153,6 +149,40 @@ class Queue(Generic[T]):
             item = self._items.popleft()
             self._seen.discard(item)
             return item
+
+    def wait_for_item(self, timeout: float | None = None) -> bool:
+        """Block until an item is available, `wake()` is called, or
+        `timeout` expires. Returns True if the event signaled (item or
+        wake), False on timeout.
+
+        Spurious returns are possible — `wake()` may have fired with no
+        new item, or a concurrent dequeue may have drained the item
+        that triggered the signal. Callers should re-check via
+        `dequeue()` after this returns.
+
+        Uses a clear-then-recheck pattern to close the missed-signal
+        race: a producer that calls `enqueue` between our "looks empty"
+        check and our `wait()` would set `_ready` AFTER our clear, so
+        the wait returns immediately."""
+        with self._lock:
+            if self._items:
+                return True
+            self._ready.clear()
+        # Re-check after clear: a producer may have raced between our
+        # first check and our clear; if so, _items has the new item OR
+        # _ready was set again after our clear (the wait below catches
+        # that). Either way, the next iteration sees the truth.
+        with self._lock:
+            if self._items:
+                return True
+        return self._ready.wait(timeout)
+
+    def wake(self) -> None:
+        """Unblock anyone waiting in `wait_for_item()`, even when no
+        item is available. Used by worker harnesses to interrupt waits
+        on shutdown — `wait_for_item` returns True, the caller loops,
+        checks its stop flag, and exits."""
+        self._ready.set()
 
     # ----- projection / recovery -----------------------------------------
 
