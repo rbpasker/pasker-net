@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from queuing import QueueRegistry
@@ -92,6 +94,39 @@ class LoggerObserver:
 
     def __call__(self, event: str, qname: str, item: Any) -> None:
         self._log.log(self._level, "%s %s %r", event, qname, item)
+
+
+@dataclass
+class WorkerStats:
+    """Per-worker counters maintained by WorkerSystem. One bump per
+    `process()` call attempt — TransientException retries are also
+    counted (they consumed worker time and signal flakiness).
+
+    - `success_count`: `process()` returned a non-error routing target
+      (next queue, fan-out, or terminal None).
+    - `permanent_failure_count`: `process()` raised a non-Transient
+      exception (routed to `error_queue`) OR returned `error_queue` as
+      its next-queue label.
+    - `transient_failure_count`: `process()` raised TransientException
+      (entry head-requeued for immediate retry).
+    - `service_total_s`: cumulative wall time inside `process()` across
+      ALL outcomes above.
+
+    `items_serviced()` = sum of the three outcome counters.
+    `service_avg_s()` = service_total_s / items_serviced.
+    """
+    success_count: int = 0
+    permanent_failure_count: int = 0
+    transient_failure_count: int = 0
+    service_total_s: float = 0.0
+
+    def items_serviced(self) -> int:
+        return (self.success_count + self.permanent_failure_count
+                + self.transient_failure_count)
+
+    def service_avg_s(self) -> float:
+        n = self.items_serviced()
+        return self.service_total_s / n if n else 0.0
 
 
 class WorkerSystem:
@@ -168,6 +203,10 @@ class WorkerSystem:
 
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        # Per-worker stats keyed by (qname, index). Initialized lazily
+        # in _worker_loop so a not-yet-started system has an empty dict.
+        self._worker_stats: dict[tuple[str, int], WorkerStats] = {}
+        self._stats_lock = threading.Lock()
 
     @property
     def registry(self) -> QueueRegistry:
@@ -242,6 +281,8 @@ class WorkerSystem:
         q = self._registry.get(qname)
         conn = self._conn_factory() if self._conn_factory is not None else None
         log.info("qworker:%s#%d started", qname, index)
+        with self._stats_lock:
+            stats = self._worker_stats.setdefault((qname, index), WorkerStats())
         try:
             while not self._stop.is_set():
                 entry = q.dequeue()
@@ -249,27 +290,30 @@ class WorkerSystem:
                     q.wait_for_item(timeout=self._wait_timeout)
                     continue
                 self._observe("deq", qname, entry)
+                t0 = time.monotonic()
+                outcome = "ok"  # "ok" | "permanent" | "transient"
                 try:
                     result = process(entry, conn)
                     if isinstance(result, str):
                         self._registry.get(result).enqueue(entry)
                         self._observe("enq", result, entry)
+                        if result == self._error_queue:
+                            outcome = "permanent"
                     elif result is not None:
                         # list[str] — fan-out. Storage durability is the
                         # consumer's problem; the worker just enqueues.
                         for next_qname in result:
                             self._registry.get(next_qname).enqueue(entry)
                             self._observe("enq", next_qname, entry)
-                    # result is None → terminal; nothing to do.
+                    # result is None → terminal; outcome stays "ok".
                 except TransientException:
-                    # Retryable: put the entry back at the HEAD of the
-                    # source queue. Does NOT route to error_queue.
                     log.warning(
                         "qworker:%s#%d transient on entry %r; "
                         "re-queuing at head", qname, index, entry,
                     )
                     q.enqueue_head(entry)
                     self._observe("enq_head", qname, entry)
+                    outcome = "transient"
                 except Exception:
                     log.exception(
                         "qworker:%s#%d process raised on entry %r",
@@ -283,6 +327,16 @@ class WorkerSystem:
                         )
                     self._registry.get(self._error_queue).enqueue(entry)
                     self._observe("enq", self._error_queue, entry)
+                    outcome = "permanent"
+                elapsed = time.monotonic() - t0
+                with self._stats_lock:
+                    stats.service_total_s += elapsed
+                    if outcome == "ok":
+                        stats.success_count += 1
+                    elif outcome == "permanent":
+                        stats.permanent_failure_count += 1
+                    else:  # transient
+                        stats.transient_failure_count += 1
         finally:
             if conn is not None and hasattr(conn, "close"):
                 try:
@@ -290,6 +344,15 @@ class WorkerSystem:
                 except Exception:
                     log.exception("qworker:%s#%d conn.close failed", qname, index)
             log.info("qworker:%s#%d exited", qname, index)
+
+    def worker_stats(self) -> dict[tuple[str, int], WorkerStats]:
+        """Snapshot of per-worker counters. Returns a shallow copy of
+        the dict so iteration is safe against concurrent updates; the
+        WorkerStats values are returned by reference (their fields may
+        tick forward while a caller reads them — acceptable for a
+        dashboard)."""
+        with self._stats_lock:
+            return dict(self._worker_stats)
 
 
 __all__ = [

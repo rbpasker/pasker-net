@@ -23,6 +23,7 @@ from .worker import (
     ObserverFn,
     ProcessFn,
     TransientException,
+    WorkerStats,
     WorkerSystem,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "ObserverFn",
     "ProcessFn",
     "TransientException",
+    "WorkerStats",
     "WorkerSystem",
 ]
