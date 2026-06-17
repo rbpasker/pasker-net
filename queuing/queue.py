@@ -1,8 +1,10 @@
 """In-memory named FIFO queues populated from a projection of the
 consumer's durable state.
 
-- A `deque` per named queue. Enqueue and dequeue are O(1) and atomic
-  across threads in this process.
+- An `OrderedDict[payload, enq_ts]` per named queue. Enqueue and
+  dequeue are O(1) and atomic across threads in this process. The
+  same structure serves both ordering (insertion-order = FIFO) and
+  dedup (key membership = O(1)).
 - Each queue is constructed with a `projection` callable that returns
   the items that should currently be on the queue, by inspecting the
   consumer's audit tables. The library holds no on-disk state of its
@@ -12,18 +14,26 @@ consumer's durable state.
   to the next queue's in-memory deque as a notification. At the next
   process start, `populate()` rebuilds the deques from the projection;
   that is the recovery mechanism. Workers must be idempotent.
+- A `QueuePriority` can gate a subset of queues into a static
+  priority group: a gated queue's blocking `dequeue()` yields only
+  when no higher-priority gated queue has items. Membership is fixed
+  for process lifetime. Payloads on gated queues must be hashable —
+  that's enforced library-wide here because gated and ungated paths
+  share the same storage type.
 """
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
-from collections import deque
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
+
+log = logging.getLogger(__name__)
 
 # Sentinel for `Queue.dequeue(timeout=...)` to distinguish "caller did
 # not pass a timeout, use the queue's configured default" from
@@ -33,15 +43,12 @@ T = TypeVar("T")
 _UNSET = object()
 
 
-@dataclass
-class QItem(Generic[T]):
-    """A queued item paired with its enqueue timestamp (monotonic).
-    `payload` is whatever the producer passed (an id, a dict, etc.);
-    `enq_ts` is `time.monotonic()` at the moment of enqueue. The
-    dequeue path returns `payload` only — `enq_ts` is consumed by the
-    queue's wait-time accumulator."""
-    payload: Any
-    enq_ts: float
+# Test-only hook fired inside `_dequeue_gated`, between `_allowed()`
+# returning True and the `popitem(last=False)` that takes the item.
+# Tests monkey-patch this to inject a race (e.g., enqueue something
+# higher-priority while a worker is committed to popping). Production:
+# stays None.
+_TEST_HOOK_AFTER_ALLOWED: "Callable[[], None] | None" = None
 
 
 # ---------------------------- Stats ----------------------------------- #
@@ -121,8 +128,14 @@ class Queue(Generic[T]):
     typically instruction IDs or task IDs that index rows in the
     consumer's durable tables.
 
-    Thread-safe within one process (a `threading.Lock` guards the deque).
-    NOT safe across processes — the deque lives in this process's heap.
+    Payloads must be hashable: storage is an OrderedDict keyed by
+    payload. Edmund's queues carry str/int ids so this is invisible
+    in-tree.
+
+    Thread-safe within one process (an `RLock` guards the deque for
+    ungated queues; a shared `Condition` owned by `QueuePriority`
+    guards them for gated queues). NOT safe across processes — the
+    storage lives in this process's heap.
     """
 
     def __init__(
@@ -138,8 +151,14 @@ class Queue(Generic[T]):
             )
         self.name = name
         self._projection = projection
-        self._items: deque[QItem] = deque()
-        self._lock = threading.Lock()
+        # OrderedDict[payload, enq_ts]: insertion-order = FIFO,
+        # key-in test = O(1) dedup. Replaces deque[QItem]+set
+        # designs by collapsing storage + dedup into one structure.
+        self._items: OrderedDict[T, float] = OrderedDict()
+        # RLock so a future caller that holds self._lock and calls
+        # len(self) doesn't deadlock. Plain Lock would. RLock cost
+        # is ~30% more than Lock — negligible at queue rates.
+        self._lock = threading.RLock()
         # Counters live in a single user-mutable Stats blob. Built-in
         # keys (`enq`, `deq`, `wait_total_s`) are pre-seeded so
         # `Stats.snapshot()`'s `dict(self)` copy never races a
@@ -154,45 +173,115 @@ class Queue(Generic[T]):
         # `0`    = non-blocking (return None immediately on empty);
         # `>0`   = block up to N seconds, then return None.
         self._dequeue_timeout = dequeue_timeout
-        # Wake-up signal for blocked dequeues. Sticky threading.Event:
-        # a set() before a wait() is not lost — the wait returns
-        # immediately. Set by enqueue and wake().
+        # Wake-up signal for blocked ungated dequeues. Sticky
+        # threading.Event: a set() before a wait() is not lost — the
+        # wait returns immediately. Set by ungated enqueue and wake().
+        # Gated paths use gate._cond, not this Event.
         self._ready = threading.Event()
         # Set by wake(); consumed by the next dequeue that finds the
         # queue empty so the caller (typically a worker checking a
         # stop flag) gets a None return instead of looping back into
         # another wait. Cleared whenever consumed.
         self._wake_pending = False
+        # Set by QueuePriority via _attach_gate. None = ungated.
+        self._gate: "QueuePriority | None" = None
+
+    # ----- gate attach ---------------------------------------------------
+
+    def _attach_gate(
+        self,
+        gate: "QueuePriority",
+        dequeue_timeout: float | None,
+    ) -> None:
+        """Called once by QueuePriority.__init__ for each member queue.
+        Construction-time only — must run before any worker thread
+        starts a `dequeue()` on this queue."""
+        if self._gate is not None:
+            raise RuntimeError(
+                f"{self.name}: already attached to a QueuePriority"
+            )
+        # The `with self._lock:` is retained so an ungated `enqueue`
+        # already mid-flight cannot interleave its _items mutation
+        # between our `_wake_pending=False` reset and the
+        # `self._gate=gate` flip — without it, the next gated
+        # dequeue could observe a stale wake state.
+        with self._lock:
+            if (
+                self._dequeue_timeout is not None
+                and self._dequeue_timeout != dequeue_timeout
+            ):
+                log.warning(
+                    "%s: per-queue dequeue_timeout=%r overridden by "
+                    "QueuePriority's dequeue_timeout=%r",
+                    self.name, self._dequeue_timeout, dequeue_timeout,
+                )
+            self._dequeue_timeout = dequeue_timeout
+            # Pre-attach wake() leaves _wake_pending=True sticky.
+            # Drop it so the first gated dequeue doesn't return None
+            # spuriously.
+            self._wake_pending = False
+            # self._ready is not cleared — gated path ignores it.
+            self._gate = gate  # last write — flips routing
+
+    def _len_locked(self) -> int:
+        """Caller MUST hold the right lock (self._lock if ungated,
+        self._gate._cond if gated)."""
+        return len(self._items)
 
     # ----- producer side -------------------------------------------------
 
     def _contains_payload(self, payload: T) -> bool:
-        """Dedup check: True if any QItem in the deque wraps `payload`."""
-        return any(qi.payload == payload for qi in self._items)
+        """O(1) dedup check. Caller must hold the right lock."""
+        return payload in self._items
 
     def enqueue(self, item: T) -> bool:
         """Append `item` to the tail. Idempotent on payload: enqueuing
         the same payload while a prior one is still pending is a no-op.
         Returns True if the item was added, False if it was already in
-        the queue. The QItem's `enq_ts` is `time.monotonic()` at this
-        call, used by dequeue() to accumulate wait time."""
-        with self._lock:
-            if self._contains_payload(item):
+        the queue. The enqueue timestamp is `time.monotonic()` at this
+        call, used by dequeue() to accumulate wait time.
+
+        Payloads must be hashable; an explicit `hash(item)` runs before
+        any lock acquire and raises `TypeError` immediately."""
+        hash(item)  # fast-fail before any lock
+        if self._gate is None:
+            with self._lock:
+                if item in self._items:
+                    return False
+                self._items[item] = time.monotonic()
+            self.stats.inc("enq")
+            self._ready.set()
+            return True
+        cond = self._gate._cond
+        with cond:
+            if item in self._items:
                 return False
-            self._items.append(QItem(payload=item, enq_ts=time.monotonic()))
-        self.stats.inc("enq")
-        self._ready.set()
+            self._items[item] = time.monotonic()
+            self.stats.inc("enq")
+            cond.notify_all()
         return True
 
     def enqueue_head(self, item: T) -> bool:
         """Insert `item` at the HEAD of the queue, so the next
         `dequeue()` returns it. Same payload-dedup as `enqueue`."""
-        with self._lock:
-            if self._contains_payload(item):
+        hash(item)
+        if self._gate is None:
+            with self._lock:
+                if item in self._items:
+                    return False
+                self._items[item] = time.monotonic()
+                self._items.move_to_end(item, last=False)
+            self.stats.inc("enq")
+            self._ready.set()
+            return True
+        cond = self._gate._cond
+        with cond:
+            if item in self._items:
                 return False
-            self._items.appendleft(QItem(payload=item, enq_ts=time.monotonic()))
-        self.stats.inc("enq")
-        self._ready.set()
+            self._items[item] = time.monotonic()
+            self._items.move_to_end(item, last=False)
+            self.stats.inc("enq")
+            cond.notify_all()
         return True
 
     # ----- consumer side -------------------------------------------------
@@ -206,35 +295,42 @@ class Queue(Generic[T]):
         - `0`              → non-blocking; return None immediately on empty.
         - positive float   → block up to that many seconds, then return None.
 
-        Returns `None` on timeout or wake() (one-shot, see below).
+        Returns `None` on timeout or wake().
         Accumulates `(deq_ts - enq_ts)` into `stats["wait_total_s"]`.
 
         Shutdown contract: `wake()` sets a one-shot `_wake_pending`
-        flag and signals `_ready`. The next dequeue that finds the
-        queue empty consumes the flag and returns None, giving the
-        caller a chance to check a stop signal. A pending enqueue
-        wins: if an item arrives concurrently, the dequeue takes it
-        and the wake flag stays armed for the following call.
+        flag. The next dequeue that finds the queue empty (ungated)
+        or that runs the wake-check (gated) consumes the flag and
+        returns None, giving the caller a chance to check a stop
+        signal.
+
+        Gated queues honor the caller-supplied timeout verbatim — the
+        gate's configured `dequeue_timeout` is only the default when
+        the caller omits the argument.
         """
+        if self._gate is None:
+            return self._dequeue_ungated(timeout)
+        return self._dequeue_gated(timeout)
+
+    def _dequeue_ungated(self, timeout: Any) -> T | None:
         eff = self._dequeue_timeout if timeout is _UNSET else timeout
         deadline = (time.monotonic() + eff) if (eff is not None and eff > 0) else None
         while True:
             with self._lock:
                 if self._items:
-                    qi = self._items.popleft()
-                    woke_target = qi  # popped under lock; stats update below
+                    payload, enq_ts = self._items.popitem(last=False)
+                    popped: tuple[T, float] | None = (payload, enq_ts)
                 elif self._wake_pending:
                     self._wake_pending = False
                     return None
                 else:
-                    woke_target = None
+                    popped = None
                     self._ready.clear()
-            if woke_target is not None:
+            if popped is not None:
+                payload, enq_ts = popped
                 self.stats.inc("deq")
-                self.stats.add("wait_total_s", time.monotonic() - woke_target.enq_ts)
-                return woke_target.payload
-            # Empty — either return immediately (timeout=0), wait
-            # bounded by deadline, or wait forever (eff is None).
+                self.stats.add("wait_total_s", time.monotonic() - enq_ts)
+                return payload
             if eff == 0:
                 return None
             remaining: float | None
@@ -245,8 +341,37 @@ class Queue(Generic[T]):
             else:
                 remaining = None
             self._ready.wait(timeout=remaining)
-            # Loop: a wake may be spurious (concurrent dequeue drained
-            # the item); we re-check under lock.
+
+    def _dequeue_gated(self, timeout: Any) -> T | None:
+        eff = self._dequeue_timeout if timeout is _UNSET else timeout
+        deadline = (time.monotonic() + eff) if (eff is not None and eff > 0) else None
+        cond = self._gate._cond  # type: ignore[union-attr]
+        payload: T
+        enq_ts: float
+        with cond:
+            while True:
+                # Order: wake → empty → allowed → pop. Wake is checked
+                # BEFORE items (inverted from ungated): under shutdown
+                # we don't want a worker about to exit to consume an
+                # in-flight item; populate-on-restart will replay it.
+                if self._wake_pending:
+                    self._wake_pending = False
+                    return None
+                if self._items and self._gate._allowed(self):  # type: ignore[union-attr]
+                    if _TEST_HOOK_AFTER_ALLOWED is not None:
+                        _TEST_HOOK_AFTER_ALLOWED()
+                    payload, enq_ts = self._items.popitem(last=False)
+                    cond.notify_all()  # drain-to-empty notify
+                    break
+                if eff == 0:
+                    return None
+                remaining = (deadline - time.monotonic()) if deadline is not None else None
+                if remaining is not None and remaining <= 0:
+                    return None
+                cond.wait(remaining)
+        self.stats.inc("deq")
+        self.stats.add("wait_total_s", time.monotonic() - enq_ts)
+        return payload
 
     def wake(self) -> None:
         """Unblock a thread blocked in `dequeue()`, even when no item
@@ -254,9 +379,14 @@ class Queue(Generic[T]):
         shutdown — the next dequeue that finds the queue empty
         consumes the wake and returns None, letting the worker check
         its stop flag and exit."""
-        with self._lock:
+        if self._gate is None:
+            with self._lock:
+                self._wake_pending = True
+            self._ready.set()
+            return
+        with self._gate._cond:
             self._wake_pending = True
-        self._ready.set()
+            self._gate._cond.notify_all()
 
     # ----- projection / boot recovery -----------------------------------
 
@@ -269,11 +399,11 @@ class Queue(Generic[T]):
         added.
 
         Call once at process start to derive the queue's contents from
-        the consumer's audit state. The in-memory deque is empty until
+        the consumer's audit state. The in-memory queue is empty until
         you do — the library does not populate itself.
 
         The projection must return unique items; the cross-call dedup
-        (skip items already in the deque) is here to handle the case
+        (skip items already in the queue) is here to handle the case
         where `populate` is called more than once, not to fix a
         consumer that emits duplicates within one call.
 
@@ -290,21 +420,36 @@ class Queue(Generic[T]):
         # to seconds, and we don't want to block dequeues during it.
         items = list(proj())
         added = 0
-        with self._lock:
+        if self._gate is None:
+            with self._lock:
+                for item in items:
+                    if item in self._items:
+                        continue
+                    self._items[item] = time.monotonic()
+                    added += 1
+            if added:
+                self.stats.add("enq", added)
+                self._ready.set()
+            return added
+        cond = self._gate._cond
+        with cond:
             for item in items:
-                if self._contains_payload(item):
+                if item in self._items:
                     continue
-                self._items.append(QItem(payload=item, enq_ts=time.monotonic()))
+                self._items[item] = time.monotonic()
                 added += 1
-        if added:
-            self.stats.add("enq", added)
-            self._ready.set()
+            if added:
+                self.stats.add("enq", added)
+                cond.notify_all()
         return added
 
     # ----- inspection ----------------------------------------------------
 
     def __len__(self) -> int:
-        with self._lock:
+        if self._gate is None:
+            with self._lock:
+                return len(self._items)
+        with self._gate._cond:
             return len(self._items)
 
     def snapshot(self) -> dict[str, Any]:
@@ -337,8 +482,52 @@ class Queue(Generic[T]):
         """Return a fresh list of currently pending payloads, in FIFO
         order. For dashboards and diagnostics only — do not use to
         drive control flow."""
-        with self._lock:
-            return [qi.payload for qi in self._items]
+        if self._gate is None:
+            with self._lock:
+                return list(self._items)
+        with self._gate._cond:
+            return list(self._items)
+
+
+# ---------------------------- QueuePriority --------------------------- #
+
+
+class QueuePriority:
+    """Static-priority gate over a set of named queues. Lower index in
+    the constructor list = higher priority. A gated queue's blocking
+    dequeue() yields its payload only when this queue is at the top of
+    the priority group. Queues outside the gate are unaffected.
+
+    Membership is fixed for process lifetime — no detach().
+
+    Must be constructed BEFORE any worker thread that will dequeue
+    from a member queue starts. Attaching to a queue with a live
+    blocked dequeue() is a programmer error.
+    """
+
+    def __init__(
+        self,
+        queues: list[Queue],
+        *,
+        dequeue_timeout: float | None = 1.0,
+    ) -> None:
+        self._queues: list[Queue] = list(queues)
+        self._prio: dict[str, int] = {q.name: i for i, q in enumerate(queues)}
+        self._cond = threading.Condition()
+        for q in queues:
+            q._attach_gate(self, dequeue_timeout)
+
+    def _allowed(self, q: Queue) -> bool:
+        """Caller MUST hold self._cond. True iff no higher-priority
+        gated queue has items pending. O(N) over the gate's members
+        (N ≤ ~10 expected); each member contributes one O(1) len read."""
+        my = self._prio[q.name]
+        for other in self._queues:
+            if other is q:
+                continue
+            if other._len_locked() > 0 and self._prio[other.name] < my:
+                return False
+        return True
 
 
 # ---------------------------- Registry -------------------------------- #
@@ -533,4 +722,4 @@ class QueueRegistry:
 
 # ---------------------------- Public API ------------------------------ #
 
-__all__ = ["Queue", "QueueRegistry", "Stats"]
+__all__ = ["Queue", "QueuePriority", "QueueRegistry", "Stats"]
