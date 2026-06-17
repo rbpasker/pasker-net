@@ -13,6 +13,6 @@ self-heal sweep.
 Multi-thread within one process; not cross-process. See README.md for
 the worker pattern; queue.py for the implementation.
 """
-from .queue import QItem, Queue, QueueRegistry
+from .queue import QItem, Queue, QueueRegistry, Stats
 
-__all__ = ["QItem", "Queue", "QueueRegistry"]
+__all__ = ["QItem", "Queue", "QueueRegistry", "Stats"]

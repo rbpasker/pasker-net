@@ -36,6 +36,52 @@ class QItem(Generic[T]):
     payload: Any
     enq_ts: float
 
+
+# ---------------------------- Stats ----------------------------------- #
+
+
+class Stats(dict):
+    """A dict subclass with thread-safe counter helpers.
+
+    Mutations (`inc`, `dec`, `add`, `sub`, `set`) take an internal lock;
+    they are atomic against each other so two threads incrementing the
+    same key from 0 both see the read-modify-write through. Reads via
+    `[k]` / `get` are best-effort and may observe a value mid-update —
+    fine for dashboards. Use `snapshot()` for a coherent copy.
+
+    No initialization required: a missing key is treated as `0` by the
+    arithmetic helpers. GIGO: `set` accepts any value, and `inc` after
+    `set("k", "string")` will raise — the bag is untyped on purpose."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._lock = threading.Lock()
+
+    def inc(self, k: str) -> None:
+        with self._lock:
+            self[k] = self.get(k, 0) + 1
+
+    def dec(self, k: str) -> None:
+        with self._lock:
+            self[k] = self.get(k, 0) - 1
+
+    def add(self, k: str, n: float) -> None:
+        with self._lock:
+            self[k] = self.get(k, 0) + n
+
+    def sub(self, k: str, n: float) -> None:
+        with self._lock:
+            self[k] = self.get(k, 0) - n
+
+    def set(self, k: str, v: Any) -> None:
+        with self._lock:
+            self[k] = v
+
+    def snapshot(self) -> dict[str, Any]:
+        """Consistent shallow copy."""
+        with self._lock:
+            return dict(self)
+
 # Identifier validator for table/column names that get interpolated into
 # SQL. SQLite has no `?` binding for identifiers, so the only safe way to
 # accept a user-supplied table or column name is to enforce a strict
@@ -98,16 +144,12 @@ class Queue(Generic[T]):
         self._projection = projection
         self._items: deque[QItem] = deque()
         self._lock = threading.Lock()
-        # Lifetime counters for stats(). Incremented in enqueue/dequeue/
-        # populate; never decremented. Reflect "how many items have ever
-        # been added/taken via this Queue object" — not the current
-        # depth, which is len(self._items).
-        self._enq_count = 0
-        self._deq_count = 0
-        # Cumulative wait time across all dequeues: sum of
-        # (deq_ts - enq_ts) per item. stats() divides by deq_count
-        # to get average time-on-queue.
-        self._wait_total_s = 0.0
+        # Counters live in a single user-mutable Stats blob. Built-in
+        # keys (`enq`, `deq`, `wait_total_s`) are written by this class;
+        # stage code is free to write its own keys (e.g.
+        # `tokens`) via `q.stats.add(...)`. `snapshot()` adds the
+        # derived view (`depth`, `wait_avg_s`).
+        self.stats = Stats()
         # Wake-up signal for blocked workers — set by enqueue. Sticky
         # threading.Event: a set() before a wait() is not lost. Consumed
         # by future worker harnesses that want to block on an empty queue
@@ -130,7 +172,7 @@ class Queue(Generic[T]):
             if self._contains_payload(item):
                 return False
             self._items.append(QItem(payload=item, enq_ts=time.monotonic()))
-            self._enq_count += 1
+        self.stats.inc("enq")
         self._ready.set()
         return True
 
@@ -141,7 +183,7 @@ class Queue(Generic[T]):
             if self._contains_payload(item):
                 return False
             self._items.appendleft(QItem(payload=item, enq_ts=time.monotonic()))
-            self._enq_count += 1
+        self.stats.inc("enq")
         self._ready.set()
         return True
 
@@ -149,15 +191,15 @@ class Queue(Generic[T]):
 
     def dequeue(self) -> T | None:
         """Pop the oldest item's payload. Returns None if the queue is
-        empty. Accumulates `(deq_ts - enq_ts)` into `_wait_total_s` so
-        stats() can report average time-on-queue."""
+        empty. Accumulates `(deq_ts - enq_ts)` into `stats["wait_total_s"]`
+        so `snapshot()` can report average time-on-queue."""
         with self._lock:
             if not self._items:
                 return None
             qi = self._items.popleft()
-            self._deq_count += 1
-            self._wait_total_s += time.monotonic() - qi.enq_ts
-            return qi.payload
+        self.stats.inc("deq")
+        self.stats.add("wait_total_s", time.monotonic() - qi.enq_ts)
+        return qi.payload
 
     def wait_for_item(self, timeout: float | None = None) -> bool:
         """Block until an item is available, `wake()` is called, or
@@ -230,8 +272,9 @@ class Queue(Generic[T]):
                 if self._contains_payload(item):
                     continue
                 self._items.append(QItem(payload=item, enq_ts=time.monotonic()))
-                self._enq_count += 1
                 added += 1
+        if added:
+            self.stats.add("enq", added)
         return added
 
     # ----- inspection ----------------------------------------------------
@@ -240,32 +283,33 @@ class Queue(Generic[T]):
         with self._lock:
             return len(self._items)
 
-    def stats(self) -> tuple[int, int, int, float, float]:
-        """Return `(enq_count, deq_count, current_depth, wait_total_s,
-        wait_avg_s)`.
+    def snapshot(self) -> dict[str, Any]:
+        """Return a consistent dict copy of `self.stats` with two
+        derived keys folded in:
 
-        - `enq_count`: lifetime count of successful `enqueue()` /
-          `populate()` adds (duplicates and no-ops not counted).
-        - `deq_count`: lifetime count of successful `dequeue()` calls
-          (None returns not counted).
-        - `current_depth`: items pending right now, i.e. `len(self)`.
+        - `depth`: items pending right now, i.e. `len(self)`.
+        - `wait_avg_s`: `wait_total_s / deq` — average time an item
+          spent on the queue before being processed. `0.0` when
+          `deq == 0`.
+
+        Built-in keys written by enqueue/dequeue/populate:
+
+        - `enq`: lifetime count of successful adds (duplicates and
+          no-ops not counted).
+        - `deq`: lifetime count of successful `dequeue()` calls (None
+          returns not counted).
         - `wait_total_s`: cumulative time items have spent on the queue,
           summed across all dequeues (`sum(deq_ts - enq_ts)`).
-        - `wait_avg_s`: `wait_total_s / deq_count` — average time an
-          item spent on the queue before being processed. `0.0` when
-          `deq_count == 0`.
-        """
-        with self._lock:
-            avg = self._wait_total_s / self._deq_count if self._deq_count else 0.0
-            return (
-                self._enq_count,
-                self._deq_count,
-                len(self._items),
-                self._wait_total_s,
-                avg,
-            )
 
-    def snapshot(self) -> list[T]:
+        Any user-added keys (e.g. `tokens`) ride along untouched.
+        """
+        s = self.stats.snapshot()
+        s["depth"] = len(self)
+        deq = s.get("deq", 0)
+        s["wait_avg_s"] = (s.get("wait_total_s", 0.0) / deq) if deq else 0.0
+        return s
+
+    def pending(self) -> list[T]:
         """Return a fresh list of currently pending payloads, in FIFO
         order. For dashboards and diagnostics only — do not use to
         drive control flow."""
@@ -340,12 +384,14 @@ class QueueRegistry:
             queues = list(self._queues.items())
         return {name: len(q) for name, q in queues}
 
-    def stats(self) -> dict[str, tuple[int, int, int, float, float]]:
-        """`{queue_name: (enq, deq, depth, wait_total_s, wait_avg_s)}`
-        for every registered queue. See `Queue.stats()`."""
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        """`{queue_name: q.snapshot()}` for every registered queue. The
+        per-queue dict carries built-in counters (`enq`/`deq`/
+        `wait_total_s`), derived `depth` and `wait_avg_s`, and any
+        stage-supplied keys (e.g. `tokens`)."""
         with self._lock:
             queues = list(self._queues.items())
-        return {name: q.stats() for name, q in queues}
+        return {name: q.snapshot() for name, q in queues}
 
     def register_from_table(
         self,
@@ -463,4 +509,4 @@ class QueueRegistry:
 
 # ---------------------------- Public API ------------------------------ #
 
-__all__ = ["Queue", "QueueRegistry"]
+__all__ = ["Queue", "QueueRegistry", "Stats"]
