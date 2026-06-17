@@ -4,8 +4,9 @@ every dequeued item.
 
 - One thread per pair; pass `[(qname, process_fn), ...]`. Repeat a
   qname to run a worker pool on the same queue.
-- Workers block in `Queue.wait_for_item()` when the queue is empty,
-  with a bounded timeout so the stop signal is observed promptly.
+- Workers block in `Queue.dequeue(timeout=...)` when the queue is
+  empty, with a bounded timeout so the stop signal is observed
+  promptly.
 - `process(entry, conn)` returns the next queue's name (`str`), a list
   of next queue names for fan-out (`list[str]`), or `None` for
   terminal. The worker handles routing; process is pure logic.
@@ -176,7 +177,7 @@ class WorkerSystem:
                       See LoggerObserver. Exceptions in the observer
                       are caught and logged; they don't disrupt worker
                       flow.
-        wait_timeout: how long a worker blocks in wait_for_item before
+        wait_timeout: how long a worker blocks in dequeue() before
                       re-checking the stop flag.
         """
         self._pairs = list(pairs)
@@ -285,9 +286,8 @@ class WorkerSystem:
             stats = self._worker_stats.setdefault((qname, index), WorkerStats())
         try:
             while not self._stop.is_set():
-                entry = q.dequeue()
+                entry = q.dequeue(timeout=self._wait_timeout)
                 if entry is None:
-                    q.wait_for_item(timeout=self._wait_timeout)
                     continue
                 self._observe("deq", qname, entry)
                 t0 = time.monotonic()

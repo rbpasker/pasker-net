@@ -13,8 +13,8 @@ Public surface:
 
 Composes with `queuing`: takes a list of `(qname, process_fn)` pairs
 plus an optional pre-built `QueueRegistry`, spawns one daemon thread
-per pair, and blocks each thread on `Queue.wait_for_item()` until a
-new item arrives, `wake()` is called, or the stop signal fires.
+per pair, and blocks each thread on `Queue.dequeue(timeout=...)` until
+a new item arrives, `wake()` is called, or the stop signal fires.
 
 See README.md for usage; worker.py for the implementation.
 """

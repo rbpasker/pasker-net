@@ -25,6 +25,13 @@ from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
+# Sentinel for `Queue.dequeue(timeout=...)` to distinguish "caller did
+# not pass a timeout, use the queue's configured default" from
+# "caller explicitly passed timeout=None, block forever". `None` already
+# means "block forever" (matches threading.Event.wait), so we need a
+# different sentinel for "use default".
+_UNSET = object()
+
 
 @dataclass
 class QItem(Generic[T]):
@@ -122,6 +129,8 @@ class Queue(Generic[T]):
         self,
         name: str,
         projection: Callable[[], Iterable[T]] | None = None,
+        *,
+        dequeue_timeout: float | None = None,
     ) -> None:
         if not name or not isinstance(name, str):
             raise ValueError(
@@ -132,16 +141,28 @@ class Queue(Generic[T]):
         self._items: deque[QItem] = deque()
         self._lock = threading.Lock()
         # Counters live in a single user-mutable Stats blob. Built-in
-        # keys (`enq`, `deq`, `wait_total_s`) are written by this class;
-        # stage code is free to write its own keys (e.g.
-        # `tokens`) via `q.stats.add(...)`. `snapshot()` adds the
-        # derived view (`depth`, `wait_avg_s`).
-        self.stats = Stats()
-        # Wake-up signal for blocked workers — set by enqueue. Sticky
-        # threading.Event: a set() before a wait() is not lost. Consumed
-        # by future worker harnesses that want to block on an empty queue
-        # rather than poll.
+        # keys (`enq`, `deq`, `wait_total_s`) are pre-seeded so
+        # `Stats.snapshot()`'s `dict(self)` copy never races a
+        # brand-new-key insertion (which CPython surfaces as
+        # `RuntimeError: dictionary changed size during iteration`).
+        # Stage code adds its own keys (e.g. `tokens`) via
+        # `q.stats.add(...)` — first add for a fresh key still has a
+        # tiny race window; pre-seed externally if it matters.
+        self.stats = Stats({"enq": 0, "deq": 0, "wait_total_s": 0.0})
+        # Default for `dequeue(timeout=...)` when the caller omits it.
+        # `None` = block forever (rely on enqueue/wake to unblock);
+        # `0`    = non-blocking (return None immediately on empty);
+        # `>0`   = block up to N seconds, then return None.
+        self._dequeue_timeout = dequeue_timeout
+        # Wake-up signal for blocked dequeues. Sticky threading.Event:
+        # a set() before a wait() is not lost — the wait returns
+        # immediately. Set by enqueue and wake().
         self._ready = threading.Event()
+        # Set by wake(); consumed by the next dequeue that finds the
+        # queue empty so the caller (typically a worker checking a
+        # stop flag) gets a None return instead of looping back into
+        # another wait. Cleared whenever consumed.
+        self._wake_pending = False
 
     # ----- producer side -------------------------------------------------
 
@@ -176,50 +197,65 @@ class Queue(Generic[T]):
 
     # ----- consumer side -------------------------------------------------
 
-    def dequeue(self) -> T | None:
-        """Pop the oldest item's payload. Returns None if the queue is
-        empty. Accumulates `(deq_ts - enq_ts)` into `stats["wait_total_s"]`
-        so `snapshot()` can report average time-on-queue."""
-        with self._lock:
-            if not self._items:
+    def dequeue(self, timeout: float | None = _UNSET) -> T | None:  # type: ignore[assignment]
+        """Block until an item is available, then return its payload.
+
+        `timeout` semantics:
+        - omitted          → use `self._dequeue_timeout` (set at __init__).
+        - `None`           → block forever (until enqueue, populate, or wake).
+        - `0`              → non-blocking; return None immediately on empty.
+        - positive float   → block up to that many seconds, then return None.
+
+        Returns `None` on timeout or wake() (one-shot, see below).
+        Accumulates `(deq_ts - enq_ts)` into `stats["wait_total_s"]`.
+
+        Shutdown contract: `wake()` sets a one-shot `_wake_pending`
+        flag and signals `_ready`. The next dequeue that finds the
+        queue empty consumes the flag and returns None, giving the
+        caller a chance to check a stop signal. A pending enqueue
+        wins: if an item arrives concurrently, the dequeue takes it
+        and the wake flag stays armed for the following call.
+        """
+        eff = self._dequeue_timeout if timeout is _UNSET else timeout
+        deadline = (time.monotonic() + eff) if (eff is not None and eff > 0) else None
+        while True:
+            with self._lock:
+                if self._items:
+                    qi = self._items.popleft()
+                    woke_target = qi  # popped under lock; stats update below
+                elif self._wake_pending:
+                    self._wake_pending = False
+                    return None
+                else:
+                    woke_target = None
+                    self._ready.clear()
+            if woke_target is not None:
+                self.stats.inc("deq")
+                self.stats.add("wait_total_s", time.monotonic() - woke_target.enq_ts)
+                return woke_target.payload
+            # Empty — either return immediately (timeout=0), wait
+            # bounded by deadline, or wait forever (eff is None).
+            if eff == 0:
                 return None
-            qi = self._items.popleft()
-        self.stats.inc("deq")
-        self.stats.add("wait_total_s", time.monotonic() - qi.enq_ts)
-        return qi.payload
-
-    def wait_for_item(self, timeout: float | None = None) -> bool:
-        """Block until an item is available, `wake()` is called, or
-        `timeout` expires. Returns True if the event signaled (item or
-        wake), False on timeout.
-
-        Spurious returns are possible — `wake()` may have fired with no
-        new item, or a concurrent dequeue may have drained the item
-        that triggered the signal. Callers should re-check via
-        `dequeue()` after this returns.
-
-        Uses a clear-then-recheck pattern to close the missed-signal
-        race: a producer that calls `enqueue` between our "looks empty"
-        check and our `wait()` would set `_ready` AFTER our clear, so
-        the wait returns immediately."""
-        with self._lock:
-            if self._items:
-                return True
-            self._ready.clear()
-        # Re-check after clear: a producer may have raced between our
-        # first check and our clear; if so, _items has the new item OR
-        # _ready was set again after our clear (the wait below catches
-        # that). Either way, the next iteration sees the truth.
-        with self._lock:
-            if self._items:
-                return True
-        return self._ready.wait(timeout)
+            remaining: float | None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+            else:
+                remaining = None
+            self._ready.wait(timeout=remaining)
+            # Loop: a wake may be spurious (concurrent dequeue drained
+            # the item); we re-check under lock.
 
     def wake(self) -> None:
-        """Unblock anyone waiting in `wait_for_item()`, even when no
-        item is available. Used by worker harnesses to interrupt waits
-        on shutdown — `wait_for_item` returns True, the caller loops,
-        checks its stop flag, and exits."""
+        """Unblock a thread blocked in `dequeue()`, even when no item
+        is available. Used by worker harnesses to interrupt waits on
+        shutdown — the next dequeue that finds the queue empty
+        consumes the wake and returns None, letting the worker check
+        its stop flag and exit."""
+        with self._lock:
+            self._wake_pending = True
         self._ready.set()
 
     # ----- projection / boot recovery -----------------------------------
@@ -262,6 +298,7 @@ class Queue(Generic[T]):
                 added += 1
         if added:
             self.stats.add("enq", added)
+            self._ready.set()
         return added
 
     # ----- inspection ----------------------------------------------------
