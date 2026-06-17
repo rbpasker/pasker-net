@@ -41,46 +41,33 @@ class QItem(Generic[T]):
 
 
 class Stats(dict):
-    """A dict subclass with thread-safe counter helpers.
+    """Dict subclass with `inc`/`dec`/`add`/`sub`/`set` counter helpers.
 
-    Mutations (`inc`, `dec`, `add`, `sub`, `set`) take an internal lock;
-    they are atomic against each other so two threads incrementing the
-    same key from 0 both see the read-modify-write through. Reads via
-    `[k]` / `get` are best-effort and may observe a value mid-update —
-    fine for dashboards. Use `snapshot()` for a coherent copy.
-
-    No initialization required: a missing key is treated as `0` by the
-    arithmetic helpers. GIGO: `set` accepts any value, and `inc` after
-    `set("k", "string")` will raise — the bag is untyped on purpose."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._lock = threading.Lock()
+    Lock-free: counters are best-effort dashboard data. The only race
+    is concurrent same-key read-modify-write, which can lose a single
+    ±1 increment. In practice most (queue, key) tuples have one writer
+    so collisions are rare and the cost is undercounting by a handful
+    over a hot queue's lifetime. GIGO: `set` accepts any value, and
+    `inc` after `set("k", "string")` will raise."""
 
     def inc(self, k: str) -> None:
-        with self._lock:
-            self[k] = self.get(k, 0) + 1
+        self[k] = self.get(k, 0) + 1
 
     def dec(self, k: str) -> None:
-        with self._lock:
-            self[k] = self.get(k, 0) - 1
+        self[k] = self.get(k, 0) - 1
 
     def add(self, k: str, n: float) -> None:
-        with self._lock:
-            self[k] = self.get(k, 0) + n
+        self[k] = self.get(k, 0) + n
 
     def sub(self, k: str, n: float) -> None:
-        with self._lock:
-            self[k] = self.get(k, 0) - n
+        self[k] = self.get(k, 0) - n
 
     def set(self, k: str, v: Any) -> None:
-        with self._lock:
-            self[k] = v
+        self[k] = v
 
     def snapshot(self) -> dict[str, Any]:
-        """Consistent shallow copy."""
-        with self._lock:
-            return dict(self)
+        """Coherent shallow copy (dict() is one C-level op)."""
+        return dict(self)
 
 # Identifier validator for table/column names that get interpolated into
 # SQL. SQLite has no `?` binding for identifiers, so the only safe way to
