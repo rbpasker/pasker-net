@@ -21,7 +21,7 @@ Shared utility modules for personal projects.
   broker when multi-process is needed. Stdlib only.
 - [`qworkers/`](qworkers/) — thread workers that loop on
   `queuing.Queue` instances, one daemon thread per `(qname, process)`
-  pair. Blocks on `Queue.wait_for_item()` when idle (no polling),
+  pair. Blocks in `Queue.dequeue(timeout=...)` when idle (no polling),
   supports worker pools by repeating pairs, and provides clean
   start/stop/join lifecycle plus a context manager. Stdlib only.
 

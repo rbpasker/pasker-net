@@ -141,8 +141,7 @@ class Queue:
                  projection: Callable[[], Iterable] | None = None)
     def enqueue(item) -> bool
     def enqueue_head(item) -> bool
-    def dequeue() -> item | None
-    def wait_for_item(timeout: float | None = None) -> bool
+    def dequeue(timeout: float | None = ...) -> item | None
     def wake() -> None
     def populate(projection: Callable | None = None) -> int
     def stats() -> tuple[int, int, int]   # (enq, deq, depth)
@@ -165,7 +164,31 @@ class QueueRegistry:
     def detect_orphans(
         conn_or_factory, table: str, *, q_column: str = "q_name",
     ) -> list[str]
+
+class QueuePriority:
+    """Static-priority gate over a set of named queues."""
+
+    def __init__(queues: list[Queue], *,
+                 dequeue_timeout: float | None = 1.0)
 ```
+
+Lower index in the constructor list = higher priority. A gated
+queue's blocking `dequeue()` yields its payload only when the queue
+has an item AND no higher-priority gated queue has items pending.
+Queues outside the gate are unaffected. Membership is fixed for
+process lifetime (no `detach`). Build the gate BEFORE starting any
+worker threads — attaching to a queue with a live blocked dequeue
+is unsupported.
+
+Gated payloads must be hashable with stable hashes — the gated
+dedup uses a set. The whole library actually requires this now;
+the previous deque-walk dedup was an implementation accident, not a
+feature.
+
+Workers running gated queues with `dequeue_timeout=None` need an
+external signal handler that calls `WorkerSystem.stop()` from the
+main thread; Python delivers SIGTERM only to the main thread and a
+worker parked in `cond.wait()` does not unblock on its own.
 
 ## Use as a git submodule
 

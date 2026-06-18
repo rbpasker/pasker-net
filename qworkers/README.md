@@ -1,8 +1,8 @@
 # qworkers
 
 Thread workers that loop on `queuing.Queue` instances. One daemon
-thread per `(qname, process_fn)` pair. Workers block on
-`Queue.wait_for_item()` when idle — no polling.
+thread per `(qname, process_fn)` pair. Workers block in
+`Queue.dequeue(timeout=...)` when idle — no polling.
 
 ## Worker pattern
 
