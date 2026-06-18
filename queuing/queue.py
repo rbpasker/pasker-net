@@ -57,31 +57,79 @@ _TEST_HOOK_AFTER_ALLOWED: "Callable[[], None] | None" = None
 class Stats(dict):
     """Dict subclass with `inc`/`dec`/`add`/`sub`/`set` counter helpers.
 
+    Per-key tracking of the running sum AND the min/max of the
+    increments observed by inc/dec/add/sub. `set` is an absolute
+    write — clears any tracked min/max for that key.
+
+    `self[k]` returns the running sum (or whatever `set` wrote);
+    `snapshot()` returns a dict where each tracked key is a 3-tuple
+    `(value, min, max)` and each set-only key is its raw value.
+
     Lock-free: counters are best-effort dashboard data. The only race
     is concurrent same-key read-modify-write, which can lose a single
     ±1 increment. In practice most (queue, key) tuples have one writer
     so collisions are rare and the cost is undercounting by a handful
-    over a hot queue's lifetime. GIGO: `set` accepts any value, and
-    `inc` after `set("k", "string")` will raise."""
+    over a hot queue's lifetime. The min/max side dicts share the same
+    best-effort model — snapshot tolerates a partial-tracking view by
+    falling back to scalar when either bound is missing. GIGO: `set`
+    accepts any value, and `inc` after `set("k", "string")` will raise."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Per-key min/max of the INCREMENTS passed to inc/dec/add/sub.
+        # `+inf` / `-inf` are the no-data sentinels: any real value
+        # beats `+inf` as a candidate min and `-inf` as a candidate
+        # max, so the first tracked sample wins. Snapshot detects the
+        # sentinels and reports the key as scalar (no triple) so
+        # downstream consumers can distinguish "no samples yet" from
+        # a real measurement of zero.
+        self._min: dict[str, float] = {}
+        self._max: dict[str, float] = {}
+
+    def _track(self, k: str, n: float) -> None:
+        if n < self._min.get(k, float("inf")):
+            self._min[k] = n
+        if n > self._max.get(k, float("-inf")):
+            self._max[k] = n
 
     def inc(self, k: str) -> None:
         self[k] = self.get(k, 0) + 1
+        self._track(k, 1)
 
     def dec(self, k: str) -> None:
         self[k] = self.get(k, 0) - 1
+        self._track(k, -1)
 
     def add(self, k: str, n: float) -> None:
         self[k] = self.get(k, 0) + n
+        self._track(k, n)
 
     def sub(self, k: str, n: float) -> None:
         self[k] = self.get(k, 0) - n
+        self._track(k, -n)
 
     def set(self, k: str, v: Any) -> None:
         self[k] = v
+        # An absolute write voids any tracked min/max — those describe
+        # the increments, not the new value.
+        self._min.pop(k, None)
+        self._max.pop(k, None)
 
     def snapshot(self) -> dict[str, Any]:
-        """Coherent shallow copy (dict() is one C-level op)."""
-        return dict(self)
+        """Coherent shallow copy. Each tracked key becomes a 3-tuple
+        `(value, min, max)` where min/max are over the increments
+        observed via inc/dec/add/sub since the key was last `set` (or
+        since process start). Each untracked key (pre-seeded or written
+        by `set`) is its scalar value."""
+        out: dict[str, Any] = {}
+        for k, v in self.items():
+            mn = self._min.get(k)
+            mx = self._max.get(k)
+            if mn is not None and mx is not None:
+                out[k] = (v, mn, mx)
+            else:
+                out[k] = v
+        return out
 
 # Identifier validator for table/column names that get interpolated into
 # SQL. SQLite has no `?` binding for identifiers, so the only safe way to
@@ -453,29 +501,44 @@ class Queue(Generic[T]):
             return len(self._items)
 
     def snapshot(self) -> dict[str, Any]:
-        """Return a consistent dict copy of `self.stats` with two
-        derived keys folded in:
+        """Return a flat dict copy of `self.stats` with derived keys
+        folded in:
 
         - `depth`: items pending right now, i.e. `len(self)`.
-        - `wait_avg_s`: `wait_total_s / deq` — average time an item
-          spent on the queue before being processed. `0.0` when
-          `deq == 0`.
+        - `wait_avg_s`: `wait_total_s / deq` — average wait per item.
+        - `wait_min_s`/`wait_max_s`: min and max per-item wait
+          observed (extracted from `wait_total_s`'s tracked triple).
 
-        Built-in keys written by enqueue/dequeue/populate:
-
-        - `enq`: lifetime count of successful adds (duplicates and
-          no-ops not counted).
-        - `deq`: lifetime count of successful `dequeue()` calls (None
-          returns not counted).
-        - `wait_total_s`: cumulative time items have spent on the queue,
-          summed across all dequeues (`sum(deq_ts - enq_ts)`).
-
-        Any user-added keys (e.g. `tokens`) ride along untouched.
+        Scalars: this method UNPACKS the triples Stats.snapshot returns
+        for tracked keys back into scalar sums (`enq`, `deq`,
+        `wait_total_s`, any user-added counters like `tokens`), so
+        existing dashboards keep working. Tracked extremes ride along
+        as `<key>_min`/`<key>_max` siblings for any user-added key. The
+        built-in `wait_*` exposes the min/max under the customary
+        `wait_min_s` / `wait_max_s` field names.
         """
-        s = self.stats.snapshot()
+        raw = self.stats.snapshot()
+        s: dict[str, Any] = {}
+        for k, v in raw.items():
+            if isinstance(v, tuple) and len(v) == 3:
+                value, mn, mx = v
+                s[k] = value
+                if k == "wait_total_s":
+                    s["wait_min_s"] = mn
+                    s["wait_max_s"] = mx
+                else:
+                    s[f"{k}_min"] = mn
+                    s[f"{k}_max"] = mx
+            else:
+                s[k] = v
         s["depth"] = len(self)
         deq = s.get("deq", 0)
         s["wait_avg_s"] = (s.get("wait_total_s", 0.0) / deq) if deq else 0.0
+        # Deliberately NOT defaulting wait_min_s/wait_max_s. Absence
+        # means "no samples yet" — fabricating 0.0 here would make an
+        # idle queue look like it had a real measurement of zero. The
+        # dashboard's _has_data check distinguishes absence from a
+        # real zero.
         return s
 
     def pending(self) -> list[T]:
