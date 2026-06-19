@@ -85,12 +85,20 @@ class Stats(dict):
         # a real measurement of zero.
         self._min: dict[str, float] = {}
         self._max: dict[str, float] = {}
+        # Per-key count of increments observed (one per inc/dec/add/sub).
+        # This is the sample population behind `_min`/`_max`; dashboards
+        # that want a mean coherent with the tracked extremes must divide
+        # the summed value by THIS, not by an unrelated item counter like
+        # `deq` (a stage may add to a key zero or many times per item, so
+        # `sum/deq` can fall outside [min, max]).
+        self._n: dict[str, int] = {}
 
     def _track(self, k: str, n: float) -> None:
         if n < self._min.get(k, float("inf")):
             self._min[k] = n
         if n > self._max.get(k, float("-inf")):
             self._max[k] = n
+        self._n[k] = self._n.get(k, 0) + 1
 
     def inc(self, k: str) -> None:
         self[k] = self.get(k, 0) + 1
@@ -110,23 +118,28 @@ class Stats(dict):
 
     def set(self, k: str, v: Any) -> None:
         self[k] = v
-        # An absolute write voids any tracked min/max — those describe
-        # the increments, not the new value.
+        # An absolute write voids any tracked min/max/count — those
+        # describe the increments, not the new value.
         self._min.pop(k, None)
         self._max.pop(k, None)
+        self._n.pop(k, None)
 
     def snapshot(self) -> dict[str, Any]:
-        """Coherent shallow copy. Each tracked key becomes a 3-tuple
-        `(value, min, max)` where min/max are over the increments
-        observed via inc/dec/add/sub since the key was last `set` (or
-        since process start). Each untracked key (pre-seeded or written
-        by `set`) is its scalar value."""
+        """Coherent shallow copy. Each tracked key becomes a 4-tuple
+        `(value, min, max, count)` summarising the increments observed via
+        inc/dec/add/sub since the key was last `set` (or since process
+        start): min/max are the extremes and count is the sample size
+        behind them. Consumers wanting a mean coherent with the extremes
+        divide `value / count` — NOT by an unrelated item counter, since a
+        key may be incremented zero or many times per item, which is what
+        makes `value / deq` fall outside [min, max]. Each untracked key
+        (pre-seeded or written by `set`) is its scalar value."""
         out: dict[str, Any] = {}
         for k, v in self.items():
             mn = self._min.get(k)
             mx = self._max.get(k)
             if mn is not None and mx is not None:
-                out[k] = (v, mn, mx)
+                out[k] = (v, mn, mx, self._n.get(k, 0))
             else:
                 out[k] = v
         return out
@@ -509,19 +522,21 @@ class Queue(Generic[T]):
         - `wait_min_s`/`wait_max_s`: min and max per-item wait
           observed (extracted from `wait_total_s`'s tracked triple).
 
-        Scalars: this method UNPACKS the triples Stats.snapshot returns
+        Scalars: this method UNPACKS the 4-tuples Stats.snapshot returns
         for tracked keys back into scalar sums (`enq`, `deq`,
         `wait_total_s`, any user-added counters like `tokens`), so
-        existing dashboards keep working. Tracked extremes ride along
-        as `<key>_min`/`<key>_max` siblings for any user-added key. The
-        built-in `wait_*` exposes the min/max under the customary
-        `wait_min_s` / `wait_max_s` field names.
+        existing dashboards keep working. Tracked extremes and sample
+        size ride along as `<key>_min`/`<key>_max`/`<key>_n` siblings for
+        any user-added key — `<key>_n` is the denominator for a mean that
+        stays within [min, max]. The built-in `wait_*` exposes its min/max
+        under the customary `wait_min_s` / `wait_max_s` names and keeps
+        `deq` as its (correct, per-item) average denominator.
         """
         raw = self.stats.snapshot()
         s: dict[str, Any] = {}
         for k, v in raw.items():
-            if isinstance(v, tuple) and len(v) == 3:
-                value, mn, mx = v
+            if isinstance(v, tuple) and len(v) == 4:
+                value, mn, mx, n = v
                 s[k] = value
                 if k == "wait_total_s":
                     s["wait_min_s"] = mn
@@ -529,6 +544,10 @@ class Queue(Generic[T]):
                 else:
                     s[f"{k}_min"] = mn
                     s[f"{k}_max"] = mx
+                    # Sample size behind this key's extremes. Dashboards
+                    # divide by this for a mean that stays within [min,max].
+                    # `wait_*` keeps its own per-item denominator (`deq`).
+                    s[f"{k}_n"] = n
             else:
                 s[k] = v
         s["depth"] = len(self)
