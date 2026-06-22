@@ -112,6 +112,10 @@ class WorkerStats:
       (entry head-requeued for immediate retry).
     - `service_total_s`: cumulative wall time inside `process()` across
       ALL outcomes above.
+    - `working`: True only while this worker is inside a `process()`
+      call — set just before the call, cleared right after it returns or
+      raises. A live "this worker is busy right now" signal for the
+      dashboard (counters are cumulative; this is instantaneous).
 
     `items_serviced()` = sum of the three outcome counters.
     `service_avg_s()` = service_total_s / items_serviced.
@@ -120,6 +124,7 @@ class WorkerStats:
     permanent_failure_count: int = 0
     transient_failure_count: int = 0
     service_total_s: float = 0.0
+    working: bool = False
 
     def items_serviced(self) -> int:
         return (self.success_count + self.permanent_failure_count
@@ -291,6 +296,10 @@ class WorkerSystem:
                     continue
                 self._observe("deq", qname, entry)
                 t0 = time.monotonic()
+                # Live busy flag: visible to the dashboard for the whole
+                # span of this process() call, cleared in the stats block
+                # below (which always runs — every outcome is caught).
+                stats.working = True
                 outcome = "ok"  # "ok" | "permanent" | "transient"
                 try:
                     result = process(entry, conn)
@@ -330,6 +339,7 @@ class WorkerSystem:
                     outcome = "permanent"
                 elapsed = time.monotonic() - t0
                 with self._stats_lock:
+                    stats.working = False
                     stats.service_total_s += elapsed
                     if outcome == "ok":
                         stats.success_count += 1
