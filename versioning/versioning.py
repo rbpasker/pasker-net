@@ -67,6 +67,31 @@ def canonical_version(
     return _with_os("-".join(parts), os_version)
 
 
+def build_number(repo_root: Optional[Union[str, Path]] = None) -> Optional[int]:
+    """Return the total commit count on HEAD (``git rev-list --count HEAD``).
+
+    This is a monotonic, history-derived integer suitable for an Apple
+    ``CFBundleVersion`` / ``CURRENT_PROJECT_VERSION``: it increases with every
+    commit, never collides, and is reproducible for a given commit. Returns
+    ``None`` if git can't be invoked or the path isn't a repo (caller decides
+    the fallback).
+
+    Note: a shallow clone undercounts. Callers that need a trustworthy number
+    (e.g. cutting a release) should verify the worktree is not shallow.
+
+    Args:
+        repo_root: Path to the git repo. Defaults to the current directory.
+    """
+    cwd = str(repo_root) if repo_root is not None else None
+    count = _git(["rev-list", "--count", "HEAD"], cwd)
+    if count is None:
+        return None
+    try:
+        return int(count)
+    except ValueError:
+        return None
+
+
 def current_os() -> str:
     """Return a short OS tag for the host, e.g. ``"macOS-14.5"`` or
     ``"Linux-6.5.0-21-generic"``.
