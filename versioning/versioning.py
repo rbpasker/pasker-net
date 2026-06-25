@@ -122,9 +122,11 @@ def _git(args: list[str], cwd: Optional[str]) -> Optional[str]:
 
 
 def _is_dirty(cwd: Optional[str]) -> bool:
-    # `git status --porcelain` prints one line per changed/untracked path;
-    # empty output ⇔ clean worktree.
-    return bool(_git(["status", "--porcelain"], cwd))
+    # "Dirty" means uncommitted changes to TRACKED files (staged or unstaged).
+    # `--untracked-files=no` excludes untracked paths (build outputs, scratch
+    # docs, generated artifacts) — those are not source changes and must not
+    # flag a build dirty. Empty output ⇔ no tracked modifications.
+    return bool(_git(["status", "--porcelain", "--untracked-files=no"], cwd))
 
 
 def _with_os(base: str, os_version: Optional[str]) -> str:

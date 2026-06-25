@@ -79,15 +79,15 @@ enum {type_name} {{
     }}
 
     /// Clean: "<X.x>-<revNumber>" — matches Apple's "X.x (revNumber)".
-    /// Dirty: appends "-[<branch>-]dirty(<buildTime>)" (branch omitted on a trunk
-    /// branch / detached HEAD).
+    /// Dirty: appends "-[<branch>-]dirty (<buildTime>)" (branch omitted on a
+    /// trunk branch / detached HEAD).
     static var build: String {{
         var s = "\\(appVersion)-\\(revNumber)"
         if gitDirty {{
             if !gitBranch.isEmpty, gitBranch != "HEAD", !mainBranches.contains(gitBranch) {{
                 s += "-\\(gitBranch)"
             }}
-            s += "-dirty(\\(buildTime))"
+            s += "-dirty (\\(buildTime))"
         }}
         return s
     }}
