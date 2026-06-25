@@ -121,12 +121,29 @@ def _git(args: list[str], cwd: Optional[str]) -> Optional[str]:
     return result.stdout.strip() or None
 
 
+# Generated artifacts of THIS versioning system. They are tracked (a committed
+# placeholder must exist so Xcode's fileSystemSynchronizedGroups include them at
+# project-load), and the build rewrites them on every run — BuildStamp.swift
+# gets a fresh timestamp, CanonicalVersion.swift is regenerated — BEFORE the
+# emit phase checks dirty. Excluding them stops the build from flagging itself
+# dirty over its own outputs. They are never hand-edited source.
+_GENERATED_EXCLUDES = (
+    ":(exclude,glob)**/CanonicalVersion.swift",
+    ":(exclude,glob)**/BuildStamp.swift",
+)
+
+
 def _is_dirty(cwd: Optional[str]) -> bool:
-    # "Dirty" means uncommitted changes to TRACKED files (staged or unstaged).
-    # `--untracked-files=no` excludes untracked paths (build outputs, scratch
-    # docs, generated artifacts) — those are not source changes and must not
-    # flag a build dirty. Empty output ⇔ no tracked modifications.
-    return bool(_git(["status", "--porcelain", "--untracked-files=no"], cwd))
+    # "Dirty" means uncommitted changes to TRACKED SOURCE (staged or unstaged).
+    #   * `--untracked-files=no` drops untracked paths (build outputs, scratch
+    #     docs) — not source changes.
+    #   * the `_GENERATED_EXCLUDES` pathspecs drop this system's own generated
+    #     stamp files, which the build rewrites before this check runs.
+    # Empty output ⇔ no tracked source modifications.
+    return bool(_git(
+        ["status", "--porcelain", "--untracked-files=no", "--", ".", *_GENERATED_EXCLUDES],
+        cwd,
+    ))
 
 
 def _with_os(base: str, os_version: Optional[str]) -> str:
