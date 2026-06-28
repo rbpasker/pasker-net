@@ -6,7 +6,9 @@ Shared utility modules for personal projects.
 
 - [`secretvault/`](secretvault/) — macOS Keychain-backed secret storage with
   env-var fallback. Pluggable backends, namespace-per-app via Keychain service
-  name. Adapted from roscoe-mcp.
+  name. Ships a self-contained CLI (`secretvault/__main__.py`) that runs as a
+  PEP 723 script and can `export`/`import` a service's secrets to move them
+  between machines. Adapted from roscoe-mcp.
 - [`versioning/`](versioning/) — `canonical_version("2.0", repo_root=..., os_version=current_os())`
   → `2.0[-<branch>]-<commit>[-dirty][ (<os>)]`. Branch is omitted on
   `main`/`master`. Ships `emit_swift.py` to generate an equivalent
@@ -80,3 +82,63 @@ python -m secretvault --service myapp list                       # all under ser
 `default_vault()` returns `KeychainVault` on macOS, `EnvironmentVault`
 elsewhere. Service name namespaces the secrets — each consuming app
 passes its own (`"edmund"`, `"roscoe"`, etc.) so keys don't collide.
+
+### Standalone CLI (run anywhere)
+
+`secretvault/__main__.py` is fully self-contained — it inlines `KeychainVault`
+and depends only on `/usr/bin/security`, so a single copy of the file runs on
+any Mac with no repo, package, or `PATH` setup. It carries a PEP 723 header and
+a `uv run` shebang. Three ways to invoke it, in order of convenience:
+
+```bash
+secretvault --service myapp list          # if copied/symlinked onto your PATH
+./secretvault/__main__.py --service myapp list   # uv shebang (needs uv)
+python3 secretvault/__main__.py --service myapp list   # any Python 3.9+, no uv
+```
+
+Install it as a `secretvault` command on your PATH:
+
+```bash
+ln -sf "$PWD/secretvault/__main__.py" ~/.local/bin/secretvault
+```
+
+(The symlink points back into this repo; if you move the repo, recreate it. Or
+just copy the file itself onto the other machine — it has no dependency on the
+repo.)
+
+### Moving secrets between machines (export / import)
+
+The login Keychain doesn't sync to iCloud for command-line tools (that needs a
+signed, provisioned app), so `export` / `import` move a service's secrets
+yourself. Bundles are JSON: `{"service": ..., "secrets": {key: value}}`.
+
+```bash
+# export to a file — written 0600, then locked to root:wheel 0400, so reading
+# or importing it back requires sudo
+secretvault --service myapp export myapp-secrets.json
+
+# export to stdout for piping / heredocs (no file on disk)
+secretvault --service myapp export
+
+# import from a file (uses sudo automatically if root-locked), stdin, or heredoc
+secretvault --service myapp import myapp-secrets.json
+secretvault --service myapp import <<'EOF'
+{"ANTHROPIC_API_KEY": "sk-..."}
+EOF
+```
+
+One-shot transfer over SSH, nothing touching disk:
+
+```bash
+secretvault --service myapp export | \
+    ssh othermac 'python3 - --service myapp import' < secretvault/__main__.py
+```
+
+Notes:
+
+- Export/import are **per `--service`** — the login Keychain holds many system
+  secrets the vault doesn't own, so there's no safe "export everything".
+- Bundles are **plaintext** JSON; the file destination is root-locked for this
+  reason. Delete bundles when done.
+- Non-ASCII secret values round-trip as hex (a `security -w` quirk); ASCII
+  secrets such as API keys/tokens are unaffected.
