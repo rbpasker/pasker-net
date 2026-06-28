@@ -9,11 +9,17 @@ Shared utility modules for personal projects.
   name. Ships a self-contained CLI (`secretvault/__main__.py`) that runs as a
   PEP 723 script and can `export`/`import` a service's secrets to move them
   between machines. Adapted from roscoe-mcp.
-- [`versioning/`](versioning/) — `canonical_version("2.0", repo_root=..., os_version=current_os())`
-  → `2.0[-<branch>]-<commit>[-dirty][ (<os>)]`. Branch is omitted on
-  `main`/`master`. Ships `emit_swift.py` to generate an equivalent
-  `CanonicalVersion` Swift enum from an Xcode Run Script Phase. Stdlib
-  only; returns `<version>-unknown` outside a git repo.
+- [`versioning/`](versioning/) — git-derived app versioning. Two surfaces:
+  - `canonical_version("2.0", repo_root=..., os_version=current_os())`
+    → `2.0[-<branch>]-<commit>[-dirty][ (<os>)]` (server/runtime stamp; branch
+    omitted on `main`/`master`; `<version>-unknown` outside a repo).
+  - `build_number(repo_root=...)` → `git rev-list --count HEAD`, a monotonic
+    integer for an Apple `CFBundleVersion` / Xcode `CURRENT_PROJECT_VERSION`.
+    `python3 -m versioning` prints it for a shell / release script.
+  Ships `emit_swift.py` to generate a `CanonicalVersion` Swift enum from an
+  Xcode Run Script Phase. The Swift `build` getter renders `X.x-<n>` (marketing
+  `X.x` + rev count `n`), so the in-app stamp matches Apple's `X.x (n)`; a dirty
+  tree appends `-[<branch>-]dirty(<buildtime>)`. Stdlib only.
 - [`queuing/`](queuing/) — in-memory named FIFO queues backed by a
   projection of the consumer's durable state. The library holds no SQL
   of its own; the consumer's audit tables are the source of truth and

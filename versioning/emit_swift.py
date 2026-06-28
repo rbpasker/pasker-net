@@ -42,11 +42,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Allow running as a script without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from versioning.versioning import _git, _is_dirty  # noqa: E402
+from versioning.versioning import _git, _is_dirty, build_number  # noqa: E402
 
 
 _TEMPLATE = '''\
@@ -59,23 +60,36 @@ enum {type_name} {{
     static let gitCommit = "{git_commit}"
     static let gitDirty  = {git_dirty}
 
+    /// `git rev-list --count HEAD` — the same monotonic integer baked into
+    /// CFBundleVersion / CURRENT_PROJECT_VERSION at release.
+    static let revNumber = {rev_number}
+
+    /// Wall-clock build time, baked **only for dirty builds** (empty otherwise,
+    /// so a clean build regenerates byte-identically). A clean build's time is
+    /// recoverable from its commit; a dirty build has no commit to point at.
+    static let buildTime = "{build_time}"
+
     /// Trunk branch names whose name is omitted from `build`.
     static let mainBranches: Set<String> = [{main_branches}]
 
-    /// CFBundleShortVersionString from the host app's Info.plist.
+    /// CFBundleShortVersionString from the host app's Info.plist — the marketing
+    /// version "X.x" (same value the App Store / Apple sees).
     static var appVersion: String {{
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
     }}
 
-    /// "<app>[-<branch>]-<commit>[-dirty]"
+    /// Clean: "<X.x>-<revNumber>" — matches Apple's "X.x (revNumber)".
+    /// Dirty: appends "-[<branch>-]dirty (<buildTime>)" (branch omitted on a
+    /// trunk branch / detached HEAD).
     static var build: String {{
-        var parts = [appVersion]
-        if !gitBranch.isEmpty, gitBranch != "HEAD", !mainBranches.contains(gitBranch) {{
-            parts.append(gitBranch)
+        var s = "\\(appVersion)-\\(revNumber)"
+        if gitDirty {{
+            if !gitBranch.isEmpty, gitBranch != "HEAD", !mainBranches.contains(gitBranch) {{
+                s += "-\\(gitBranch)"
+            }}
+            s += "-dirty (\\(buildTime))"
         }}
-        parts.append(gitCommit)
-        if gitDirty {{ parts.append("dirty") }}
-        return parts.joined(separator: "-")
+        return s
     }}
 
     /// "<Platform>-<version>", e.g. "iOS-17.5" / "macOS-14.5".
@@ -123,11 +137,18 @@ def emit(
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd) or ""
     commit = _git(["rev-parse", "--short", "HEAD"], cwd) or "unknown"
     dirty = _is_dirty(cwd)
+    rev = build_number(cwd)
+    rev = rev if rev is not None else 0
+    # Buildtime is baked ONLY for dirty builds; clean builds leave it empty so
+    # the generated file is byte-identical across rebuilds (idempotent).
+    build_time = datetime.now().astimezone().isoformat(timespec="minutes") if dirty else ""
     return _TEMPLATE.format(
         type_name=type_name,
         git_branch=_swift_escape(branch),
         git_commit=_swift_escape(commit),
         git_dirty="true" if dirty else "false",
+        rev_number=rev,
+        build_time=_swift_escape(build_time),
         main_branches=", ".join(f'"{_swift_escape(b)}"' for b in main_branches),
     )
 
