@@ -36,7 +36,8 @@ Options:
     -v, --verbose      print the derivation (component, base tag, branch,
                        commit, dirty) to stderr; stdout stays the bare result.
   mutually exclusive (default prints the canonical version):
-    --list             list every component's latest version, one per line
+    --list             list every component's latest version and the commit
+                       it was cut at: `<component>  <X.x>  <sha>`, one per line
                        (the bare lineage shows as `(bare)`)
     --build-number     instead print `git rev-list --count HEAD` (the
                        monotonic integer for Apple CFBundleVersion)
@@ -246,12 +247,19 @@ def main() -> int:
         if not versions:
             print("(no version tags)")
             return 0
+
+        def _sha(comp: Optional[str], version: str) -> str:
+            tag = f"{comp}-{version}" if comp else version
+            return _git(["rev-parse", "--short", f"{tag}^{{commit}}"], cwd) or "?"
+
         named = sorted(c for c in versions if c is not None)
-        width = max((len(c) for c in named), default=6)
-        for comp in named:
-            print(f"{comp:<{width}}  {versions[comp]}")
-        if None in versions:
-            print(f"{'(bare)':<{width}}  {versions[None]}")
+        labels = named + ([None] if None in versions else [])
+        name_w = max((len(c) for c in named), default=6)
+        name_w = max(name_w, len("(bare)") if None in versions else 0)
+        ver_w = max(len(v) for v in versions.values())
+        for comp in labels:
+            label = comp if comp is not None else "(bare)"
+            print(f"{label:<{name_w}}  {versions[comp]:<{ver_w}}  {_sha(comp, versions[comp])}")
         return 0
 
     if args.build_number:

@@ -283,15 +283,17 @@ class IncrementCLI(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout.strip(), "server-3.0")
 
-    def test_list_shows_every_component(self) -> None:
+    def test_list_shows_every_component_with_sha(self) -> None:
         with _TempRepo("queuing-1.0", "versioning-2.0", "1.5") as repo:
+            head = _git(repo, "rev-parse", "--short", "HEAD")
             result = self._run(repo, "--list")
             self.assertEqual(result.returncode, 0)
             lines = result.stdout.splitlines()
-            # Named components first (alphabetical), bare lineage last.
-            self.assertEqual(lines[0].split(), ["queuing", "1.0"])
-            self.assertEqual(lines[1].split(), ["versioning", "2.0"])
-            self.assertEqual(lines[-1].split(), ["(bare)", "1.5"])
+            # Each line is `<component>  <version>  <sha>`; named components
+            # first (alphabetical), bare lineage last. All tags here are on HEAD.
+            self.assertEqual(lines[0].split(), ["queuing", "1.0", head])
+            self.assertEqual(lines[1].split(), ["versioning", "2.0", head])
+            self.assertEqual(lines[-1].split(), ["(bare)", "1.5", head])
 
 
 if __name__ == "__main__":

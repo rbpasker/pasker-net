@@ -317,14 +317,15 @@ is `+1` with minor reset (`2.3 → 3.0`). With no prior tag they bootstrap from
 
 Each module releases on its own lineage, so `queuing-1.0`, `qworkers-1.0`,
 `secretvault-1.0`, and `versioning-1.0` advance independently and never shadow
-each other. `--list` shows every component's latest version at a glance:
+each other. `--list` shows every component's latest version and the commit it
+was cut at, at a glance:
 
 ```bash
 $ python3 -m versioning --list
-queuing      1.0
-qworkers     1.0
-secretvault  1.0
-versioning   1.0
+queuing      1.0  4ed7dad
+qworkers     1.0  4ed7dad
+secretvault  1.0  4ed7dad
+versioning   1.1  fe38cee
 ```
 
 To read one module's live version, scope the query to its component (this is
