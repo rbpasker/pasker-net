@@ -64,40 +64,110 @@ def cmd_exists(args: argparse.Namespace) -> int:
     return 1
 
 
-def cmd_list(args: argparse.Namespace) -> int:
-    """List all keys under the given service.
+def _service_accounts(service: str) -> list[str]:
+    """All account (key) names stored under `service`, sorted and deduped.
 
-    `security` doesn't have a direct "list by service" subcommand, so we
-    dump the whole login keychain and filter to entries whose `svce`
-    field matches `args.service`. Output sorted, deduped.
+    `security` has no "list by service" subcommand, so dump the keychain and
+    filter by the `svce` attribute. dump-keychain prints one record per item,
+    each starting with `keychain: "..."`, then attribute lines like:
+        "svce"<blob>="edmund"
+        "acct"<blob>="EDMUND_SESSION_SECRET"
+    The attribute NAME is the first quoted token (svce/acct), NOT the whole
+    `"svce"<blob>` left-hand side — keying on the latter never matches.
     """
     result = subprocess.run(
         ["security", "dump-keychain"],
         capture_output=True, text=True,
     )
-    current: dict[str, str] = {}
     accounts: list[str] = []
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        if current.get("svce") == service and current.get("acct"):
+            accounts.append(current["acct"])
+
     for raw in result.stdout.splitlines():
         line = raw.strip()
         if line.startswith("keychain:"):
-            if current.get("svce") == f'"{args.service}"':
-                acct = current.get("acct", "").strip('"')
-                if acct:
-                    accounts.append(acct)
-            current = {}
-        elif "=" in line:
-            k, _, v = line.partition("=")
-            current[k.strip()] = v.strip()
-    if current.get("svce") == f'"{args.service}"':
-        acct = current.get("acct", "").strip('"')
-        if acct:
-            accounts.append(acct)
+            flush()
+            current.clear()
+            continue
+        if not line.startswith('"'):
+            continue
+        end = line.find('"', 1)
+        eq = line.find("=", end) if end > 0 else -1
+        if end <= 0 or eq < 0:
+            continue
+        name = line[1:end]
+        val = line[eq + 1:].strip()
+        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = val[1:-1]
+        elif val == "<NULL>":
+            val = ""
+        current[name] = val
+    flush()
+    return sorted(set(accounts))
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List all key names under the given service."""
+    accounts = _service_accounts(args.service)
     if not accounts:
         print(f"no secrets found for service '{args.service}'")
         return 0
     print(f"secrets for service '{args.service}':")
-    for acct in sorted(set(accounts)):
+    for acct in accounts:
         print(f"  - {acct}")
+    return 0
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    """Dump all keys under the service, for backup or as a manifest.
+
+    Default: `KEY=VALUE` per line — the REAL secrets (hand-carry to another host,
+    `import`, then delete). `--no-secrets`: key NAMES only, safe to commit (e.g.
+    a secrets.txt.example manifest). A leading `#` header documents which it is.
+    """
+    accounts = _service_accounts(args.service)
+    lines = [f"# secretvault extract{' --no-secrets' if args.no_secrets else ''} "
+             f"(service: {args.service})"]
+    if args.no_secrets:
+        lines += accounts
+    else:
+        lines.append("# KEY=VALUE — REAL secrets. Do NOT commit. import, then delete.")
+        vault = KeychainVault(service=args.service)
+        for acct in accounts:
+            lines.append(f"{acct}={vault.get(acct) or ''}")
+    text = "\n".join(lines) + "\n"
+    if args.output and args.output != "-":
+        with open(args.output, "w") as fh:
+            fh.write(text)
+        print(f"wrote {len(accounts)} key(s) to {args.output}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """Load `KEY=VALUE` lines (from `extract`) into the keychain via set().
+
+    '#' comments and blank lines are ignored; existing keys are overwritten.
+    """
+    src = sys.stdin if (not args.input or args.input == "-") else open(args.input)
+    vault = KeychainVault(service=args.service)
+    count = 0
+    try:
+        for raw in src:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            vault.set(key.strip(), val)
+            count += 1
+    finally:
+        if src is not sys.stdin:
+            src.close()
+    print(f"imported {count} secret(s) into service '{args.service}'", file=sys.stderr)
     return 0
 
 
@@ -132,6 +202,17 @@ def main() -> int:
 
     p = subs.add_parser("list", help="List all secrets under this service")
     p.set_defaults(func=cmd_list)
+
+    p = subs.add_parser("extract",
+                        help="Dump all keys (KEY=VALUE, or names with --no-secrets)")
+    p.add_argument("--no-secrets", action="store_true",
+                   help="names only, omit values (safe to commit as a manifest)")
+    p.add_argument("-o", "--output", help="write to FILE instead of stdout")
+    p.set_defaults(func=cmd_extract)
+
+    p = subs.add_parser("import", help="Load KEY=VALUE lines into the keychain")
+    p.add_argument("-i", "--input", help="read from FILE instead of stdin")
+    p.set_defaults(func=cmd_import)
 
     args = parser.parse_args()
     return args.func(args)
