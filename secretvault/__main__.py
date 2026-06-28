@@ -226,27 +226,40 @@ def cmd_export(args: argparse.Namespace) -> int:
     The summary line goes to stderr so stdout stays clean for piping.
     """
     vault = KeychainVault(service=args.service)
-    secrets: dict[str, str] = {}
-    for acct in _accounts_for_service(args.service):
-        value = vault.get(acct)
-        if value is not None:
-            secrets[acct] = value
+    accounts = _accounts_for_service(args.service)
+    if args.no_secrets:
+        # Names only: values are null. The result carries no secrets, so it's a
+        # plain world-readable file — a committable manifest (e.g. secrets.json.example).
+        secrets: dict[str, "str | None"] = {acct: None for acct in accounts}
+    else:
+        secrets = {}
+        for acct in accounts:
+            value = vault.get(acct)
+            if value is not None:
+                secrets[acct] = value
     payload = {"service": args.service, "secrets": secrets}
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
     if args.file and args.file != "-":
-        fd = os.open(args.file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text)
-        if _lock_to_root(args.file):
-            locked = "root-owned, mode 0400 — needs sudo to read/import"
+        if args.no_secrets:
+            with open(args.file, "w") as fh:
+                fh.write(text)
+            print(f"wrote {len(secrets)} key name(s) (no values) for service "
+                  f"'{args.service}' to {args.file}", file=sys.stderr)
         else:
-            locked = "WARNING: could not lock with sudo; left mode 0600 (readable by you)"
-        print(f"exported {len(secrets)} secret(s) for service '{args.service}' "
-              f"to {args.file} ({locked})", file=sys.stderr)
+            fd = os.open(args.file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(text)
+            if _lock_to_root(args.file):
+                locked = "root-owned, mode 0400 — needs sudo to read/import"
+            else:
+                locked = "WARNING: could not lock with sudo; left mode 0600 (readable by you)"
+            print(f"exported {len(secrets)} secret(s) for service '{args.service}' "
+                  f"to {args.file} ({locked})", file=sys.stderr)
     else:
         sys.stdout.write(text)
-        print(f"exported {len(secrets)} secret(s) for service '{args.service}'",
+        kind = "key name(s) (no values)" if args.no_secrets else "secret(s)"
+        print(f"exported {len(secrets)} {kind} for service '{args.service}'",
               file=sys.stderr)
     return 0
 
@@ -344,6 +357,8 @@ def main() -> int:
     p = subs.add_parser("export", help="Export all secrets under this service as JSON")
     p.add_argument("file", nargs="?", default=None,
                    help="Output file (created mode 0600); omit or '-' for stdout")
+    p.add_argument("--no-secrets", action="store_true",
+                   help="values null (names only); world-readable, safe to commit as a manifest")
     p.set_defaults(func=cmd_export)
 
     p = subs.add_parser("import", help="Import secrets from JSON (file, stdin, or heredoc)")
