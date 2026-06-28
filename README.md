@@ -2,6 +2,13 @@
 
 Shared utility modules for personal projects.
 
+A note from the human: You can call this "vibe coded," but the reality
+is that I designed, code reviewed, and tested everyting in this
+myself, and it is all running live in production in a number of
+personal projects. Each module can be used independently (except
+qworkers).  --Bob @ you know where
+
+
 ## Modules
 
 - [`secretvault/`](secretvault/) — macOS Keychain-backed secret storage with
@@ -23,15 +30,21 @@ Shared utility modules for personal projects.
 - [`queuing/`](queuing/) — in-memory named FIFO queues backed by a
   projection of the consumer's durable state. The library holds no SQL
   of its own; the consumer's audit tables are the source of truth and
-  `repopulate()` re-derives the in-memory cache from a projection
-  callable at boot or as a self-heal sweep. Multi-thread native
-  (single-process); the small `Queue` interface ports cleanly to a real
-  broker when multi-process is needed. Stdlib only.
+  `populate()` re-derives the in-memory cache from a projection
+  callable at boot or as a self-heal sweep. Per-queue `stats` and a
+  `snapshot()` (depth, enq/deq, wait avg/min/max, plus stage-added
+  counters) feed dashboards; `QueuePriority` adds a static-priority gate
+  over a queue group. Multi-thread native (single-process); the small
+  `Queue` interface ports cleanly to a real broker when multi-process is
+  needed. Stdlib only.
 - [`qworkers/`](qworkers/) — thread workers that loop on
   `queuing.Queue` instances, one daemon thread per `(qname, process)`
   pair. Blocks in `Queue.dequeue(timeout=...)` when idle (no polling),
   supports worker pools by repeating pairs, and provides clean
-  start/stop/join lifecycle plus a context manager. Stdlib only.
+  start/stop/join lifecycle plus a context manager. An `observer` hook
+  reports every enq/deq/drop event and per-worker `WorkerStats`
+  (throughput, service time, live busy flag) complement the queue stats.
+  Stdlib only.
 
 ## Use as a git submodule
 

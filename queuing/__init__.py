@@ -3,10 +3,10 @@ consumer's durable state.
 
 Public surface:
 
-    from queuing import Queue, QueueRegistry
+    from queuing import Queue, QueuePriority, QueueRegistry, Stats
 
 The consumer's audit tables are the source of truth; this library is
-an in-memory working cache for fast dequeue, with `repopulate()` that
+an in-memory working cache for fast dequeue, with `populate()` that
 re-derives the cache from a projection callable at boot or as a
 self-heal sweep.
 

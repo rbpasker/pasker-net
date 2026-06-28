@@ -5,24 +5,30 @@ submodule (e.g. `edmund/vendor/pasker-net`, `roscoe-mcp/common/...`, alfred).
 Any consumer may need to change it, and different consumers may be pinned to
 **different commits**.
 
-## Rules for changes (read before editing)
+## Where you are decides how you land a change
 
-- **Changes belong upstream, via PR.** If you change this package from inside a
-  consumer's vendored copy, you MUST offer to push the change back to the
-  canonical repo (`github.com/rbpasker/pasker-net`): open a branch and a PR
-  (direct pushes to `main` are blocked), then bump the consumer's submodule
-  pointer to the merged commit. Never leave a vendored copy silently diverged
-  from origin — that's invisible to every other consumer.
+- **In this canonical `pasker-net` repo (the development directory): commit
+  straight to `main`.** No PR needed. Commit and push directly. (Only commit or
+  push when explicitly asked.)
+
+- **From inside a consumer's vendored copy: submit a PR.** If you change this
+  package from a consumer's vendored submodule, push the change back to the
+  canonical repo (`github.com/rbpasker/pasker-net`) via a branch and PR, then
+  bump the consumer's submodule pointer to the merged commit. Never leave a
+  vendored copy silently diverged from origin — that's invisible to every other
+  consumer.
+
+## Other rules
 
 - **A vendored copy may be pinned to an OLD commit.** Before concluding a
   feature is missing or broken, `git fetch` the submodule and check the
   canonical repo. The fix is often a submodule *bump*, not new code — don't
   reimplement something that already exists upstream.
 
-- **Do not make out-of-band edits in a separate development-root clone of
-  pasker-net.** Uncommitted/unpushed changes there are invisible to consumers
-  and cause the same silent divergence. Make the change where you are working
-  (the vendored copy), push it back via PR, then bump everywhere.
+- **Don't leave changes uncommitted/unpushed.** The hazard is silent divergence:
+  edits that exist only in a working tree are invisible to consumers. Land the
+  change where you're working — commit+push here, or PR+bump from a vendored
+  copy.
 
 - **Keep it dependency-light and self-contained.** Consumers vendor this to
   avoid a package install; the macOS Keychain backend only needs

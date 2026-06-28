@@ -180,6 +180,42 @@ observer by hand at those sites if you want them logged.
 Observer exceptions are caught and logged; they never disrupt the
 worker.
 
+## Per-worker stats
+
+Independent of the observer, `WorkerSystem` keeps a `WorkerStats` record
+per `(qname, index)` pair — cumulative counters plus a live busy flag —
+for dashboards. Read a snapshot at any time:
+
+```python
+for (qname, index), st in ws.worker_stats().items():
+    print(qname, index,
+          "busy" if st.working else "idle",
+          st.items_serviced(), f"{st.service_avg_s():.3f}s avg")
+```
+
+`worker_stats()` returns a shallow copy of the dict (safe to iterate),
+but each `WorkerStats` value is live by reference — its fields may tick
+forward while you read them, which is fine for a dashboard.
+
+Each record carries:
+
+| field                      | meaning                                                                                 |
+|----------------------------|-----------------------------------------------------------------------------------------|
+| `success_count`            | `process()` returned a routing target (next queue, fan-out, or terminal `None`)         |
+| `permanent_failure_count`  | `process()` raised a non-Transient exception, or returned `error_queue` as its target   |
+| `transient_failure_count`  | `process()` raised `TransientException` (entry head-requeued for immediate retry)       |
+| `service_total_s`          | cumulative wall time inside `process()` across all three outcomes                        |
+| `working`                  | `True` only while this worker is currently inside a `process()` call (instantaneous)     |
+
+with `items_serviced()` (sum of the three outcome counters) and
+`service_avg_s()` (`service_total_s / items_serviced`). One bump per
+`process()` attempt — `TransientException` retries are counted too, since
+they consumed worker time and signal flakiness.
+
+This is the worker-side complement to `queuing`'s queue-side
+`Queue.snapshot()` / `QueueRegistry.snapshot()`: queue stats show backlog
+and wait time, worker stats show throughput and service time.
+
 ## Sample app
 
 `qworkers/tests/sample_app.py` runs an N-stage pipeline with M
@@ -201,6 +237,19 @@ a final tally.
 ProcessFn = Callable[[Any, Any], str | list[str] | None]
 #   (entry, conn) -> next qname | list of next qnames | terminal
 
+ObserverFn = Callable[[str, str, Any], None]
+#   (event, qname, item) -> None   # event in {"deq","enq","enq_head","drop"}
+
+@dataclass
+class WorkerStats:
+    success_count: int = 0
+    permanent_failure_count: int = 0
+    transient_failure_count: int = 0
+    service_total_s: float = 0.0
+    working: bool = False
+    def items_serviced() -> int          # sum of the three outcome counters
+    def service_avg_s() -> float         # service_total_s / items_serviced
+
 class WorkerSystem:
     def __init__(
         pairs: list[tuple[str, ProcessFn]],
@@ -208,6 +257,7 @@ class WorkerSystem:
         registry: QueueRegistry | None = None,
         conn_factory: Callable[[], Any] | None = None,
         error_queue: str | None = None,
+        observer: ObserverFn | None = None,
         wait_timeout: float = 1.0,
     )
     registry: QueueRegistry        # read-only property
@@ -215,6 +265,7 @@ class WorkerSystem:
     def start() -> None
     def stop(*, join_timeout: float | None = None) -> None
     def join(*, timeout: float | None = None) -> None
+    def worker_stats() -> dict[tuple[str, int], WorkerStats]
     def __enter__() -> WorkerSystem
     def __exit__(exc_type, exc_val, exc_tb) -> bool
 ```
