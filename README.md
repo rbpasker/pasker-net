@@ -6,7 +6,7 @@ A note from the human: You can call this "vibe coded," but the reality
 is that I designed, code reviewed, and tested everyting in this
 myself, and it is all running live in production in a number of
 personal projects. Each module can be used independently (except
-qworkers).  --Bob @ you know where
+qworkers). PRs welcome. --Bob at y0u kn0w wh3r3
 
 
 ## Modules

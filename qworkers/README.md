@@ -15,25 +15,37 @@ registry = QueueRegistry()
 registry.register_from_table(
     sqlite3.connect("app.db"),
     table="q_item",
-    queue_names=["categorize", "request", "plan", "error"],
+    queue_names=["ingest", "categorize", "filter", "done", "error"],
     id_column="payload",
 )
 registry.populate_all()
 
+# Pipeline: ingest -> categorize -> filter -> done
+
+def ingest(entry, conn):
+    do_ingest(entry, conn)
+    return "categorize"               # next queue name
+
 def categorize(entry, conn):
     conn.execute("BEGIN IMMEDIATE")
-    do_categorize(entry, conn)        # writes audit row with q='request'
+    do_categorize(entry, conn)        # writes audit row with q='filter'
     conn.commit()
-    return "request"                  # next queue name
+    return "filter"                   # next queue name
 
-def request(entry, conn):
-    do_request(entry, conn)
+def filter_(entry, conn):
+    do_filter(entry, conn)
+    return "done"                     # next queue name
+
+def done(entry, conn):
+    do_finalize(entry, conn)
     return None                       # terminal
 
 ws = WorkerSystem(
     pairs=[
+        ("ingest",     ingest),
         ("categorize", categorize),
-        ("request",    request),
+        ("filter",     filter_),
+        ("done",       done),
     ],
     registry=registry,
     conn_factory=lambda: sqlite3.connect("app.db", isolation_level=None),

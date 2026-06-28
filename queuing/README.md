@@ -1,135 +1,98 @@
 # queuing
 
-In-memory named FIFO queues whose contents are populated from a
-projection of the consumer's durable state. Multi-thread safe within
-one process; the deque's lock makes `dequeue()` atomic across worker
-threads.
+In-memory named FIFO queues, thread-safe within one process. Use them
+three ways, each building on the last:
 
-## Worker pattern
+1. **[Pure in-memory](#pure-in-memory-no-backing-store)** — a plain
+   thread-safe work queue.
+2. **[With priorities](#with-priorities)** — a static priority order
+   across a set of queues.
+3. **[With a backing store](#with-a-backing-store-durable-crash-recoverable)**
+   — back each queue with a projection of your durable state so it
+   survives a restart.
+
+For the thread-per-queue worker harness, see the companion
+[`qworkers`](../qworkers/README.md) package.
+
+## Pure in-memory (no backing store)
+
+At its simplest a `Queue` is a thread-safe FIFO. Construct one, `enqueue`
+payloads, `dequeue` them in order:
 
 ```python
-import sqlite3, time
+from queuing import Queue
+
+q = Queue("jobs")
+q.enqueue("a")
+q.enqueue("b")
+q.dequeue()                     # -> "a"
+```
+
+`dequeue()` blocks while the queue is empty until something is enqueued.
+Pass `timeout=` to bound the wait (`0` = non-blocking, `None` = block
+forever, a positive float = seconds then return `None`), or set a per-queue
+default with `Queue("jobs", dequeue_timeout=1.0)`. `wake()` unblocks a
+waiting dequeue so a worker can re-check a stop flag and exit.
+
+A `QueueRegistry` is a named collection — register queues by name, then
+hand each worker the queue it needs:
+
+```python
 from queuing import QueueRegistry
 
 reg = QueueRegistry()
-
-def categorize_projection():
-    conn = sqlite3.connect("yourapp.db")
-    return [row[0] for row in conn.execute(
-        "SELECT s.instruction_id FROM stages s "
-        "LEFT JOIN stages t "
-        "  ON t.instruction_id = s.instruction_id AND t.stage_name='categorize' "
-        "WHERE s.q = 'categorize' AND t.instruction_id IS NULL"
-    )]
-
-reg.register("categorize", projection=categorize_projection)
-reg.register("request",    projection=request_projection)
-
-# Fill every queue from its projection at process start.
-reg.populate_all()
-
-# Worker thread for the categorize queue:
-q_in  = reg.get("categorize")
-q_out = reg.get("request")
-
-while not should_stop:
-    payload = q_in.dequeue()
-    if payload is None:
-        time.sleep(POLL_INTERVAL)
-        continue
-    conn = sqlite3.connect("yourapp.db", isolation_level=None)
-    conn.execute("BEGIN IMMEDIATE")
-    do_categorize(payload, conn)            # writes stages.categorize row with q='request'
-    conn.commit()
-    q_out.enqueue(payload)                  # notification AFTER commit
+reg.register("jobs")
+reg.get("jobs").enqueue(payload)   # KeyError on an unregistered name
 ```
 
-Always commit first; the in-memory `enqueue` is a notification AFTER
-the durable state has advanced. A rollback before commit leaves the
-on-disk state unchanged; the next process restart re-derives the item
-via `populate()`.
+Multi-thread native: a single `Queue` feeds N worker threads pulling
+concurrently — `dequeue()` is atomic, so no two threads ever see the same
+payload. Payloads must be hashable; storage is an `OrderedDict` keyed by
+payload, which also makes `enqueue` idempotent (re-enqueuing an item
+already on the queue is a no-op).
 
-## Factory: build a registry from a queue-shaped table
+In this mode the queue holds only what you `enqueue` — there's no durable
+source of truth, so anything still queued is lost on process exit. That's
+fine when the producer lives in the same process and you don't need crash
+recovery; add a backing store (below) when a queue must survive a restart.
 
-When your durable queue state lives in a table with a `q_name` column
-(one row per queue item, queue assignment in `q_name`), the
-`register_from_table` factory builds projections for every named queue
-in one call:
+## With priorities
+
+`QueuePriority` gates a set of queues into a static priority order — lower
+index = higher priority. A gated queue's `dequeue()` yields only when no
+higher-priority gated queue has anything pending:
 
 ```python
-import sqlite3
-from queuing import QueueRegistry
+from queuing import Queue, QueuePriority
 
-conn = sqlite3.connect("yourapp.db")
+high = Queue("high")
+low  = Queue("low")
+gate = QueuePriority([high, low])   # high outranks low
 
-reg = QueueRegistry()
-reg.register_from_table(
-    conn,
-    table="q_item",
-    queue_names=["categorize", "request", "plan", "research"],
-    q_column="q_name",          # default
-    id_column="payload",
-    where_extra=None,           # optional SQL appended to WHERE
-)
-reg.populate_all()
-queue = reg.get("categorize")
+low.enqueue("batch")
+high.enqueue("urgent")
+
+high.dequeue()   # -> "urgent"
+low.dequeue()    # -> "batch"  (only because high is now empty)
 ```
 
-Each queue's projection is `SELECT <id_column> FROM <table> WHERE
-<q_column> = 'X' [AND <where_extra>]`. Items move between queues by
-the consumer's worker doing `UPDATE <table> SET <q_column>='<next>'
-WHERE …` in its own transaction — that commit IS the dequeue+enqueue.
+You never call methods on `gate` directly — constructing it is what does
+the work. `QueuePriority(...)` reaches into each queue you pass and rewires
+its `dequeue()` to honor the priority, so you keep dequeuing from `high`
+and `low` exactly as before and the gating happens invisibly. Just keep
+`gate` alive: each member queue holds a reference back to it, so it won't
+be garbage-collected, but binding it to a name keeps that explicit.
 
-## Integrity
-
-All queue interaction goes through `QueueRegistry.get(name)`, which
-raises `KeyError` for unregistered names. Workers can neither enqueue
-to nor dequeue from a queue they didn't register. The registry is the
-contract for which queues exist; nothing outside it can address a queue.
-
-For forensic detection of pre-existing rows with retired queue names,
-call `detect_orphans(conn, table)` — returns a list of `q_name` values
-present in the table but not registered. Decide what to do — log,
-alert, delete, migrate, ignore.
-
-## Multi-thread workers
-
-A single Queue object supports N worker threads pulling from it
-concurrently. `dequeue()` is atomic; two threads can't see the same
-payload. Run as many threads as the consumer's database can handle
-concurrent writes against.
-
-## What goes on the consumer's tables
-
-The consumer's tables carry the queue assignment:
-
-```sql
-ALTER TABLE stages ADD COLUMN q TEXT;
-ALTER TABLE tasks  ADD COLUMN q TEXT;
-```
-
-Projection for queue `Y` over stages:
-
-```sql
-SELECT s.instruction_id FROM stages s
-LEFT JOIN stages downstream
-       ON downstream.instruction_id = s.instruction_id
-      AND downstream.stage_name = 'Y'
-WHERE  s.q = 'Y'
-  AND  downstream.instruction_id IS NULL
-ORDER BY s.seq
-```
-
-For executor queues over `tasks`:
-
-```sql
-SELECT t.id FROM tasks t
-WHERE  t.q = 'Y' AND t.status NOT LIKE 'done:%'
-ORDER BY t.seq
-```
-
-For a bootstrap queue (e.g., ingest), no upstream stage row exists;
-project from the source table directly.
+- Build the gate **before** starting any worker threads — attaching to a
+  queue that already has a blocked `dequeue()` is unsupported. Membership
+  is fixed for the process lifetime (no `detach`).
+- Queues outside the gate are unaffected.
+- The gate's `dequeue_timeout` (default `1.0`) becomes the default wait for
+  its member queues; a caller-supplied `timeout=` still overrides it.
+- A worker on a gated queue with `dequeue_timeout=None` (block forever)
+  needs an external signal handler to call `WorkerSystem.stop()` from the
+  main thread — Python delivers SIGTERM only to the main thread, and a
+  worker parked in `cond.wait()` won't unblock on its own.
 
 ## Stats & observability
 
@@ -193,12 +156,176 @@ q.snapshot()
 ### Registry-wide
 
 ```python
-reg.depths()     # {"categorize": 15, "request": 3, ...}     current depth per queue
-reg.snapshot()   # {"categorize": {...}, "request": {...}}    q.snapshot() per queue
+reg.depths()     # {"ingest": 0, "categorize": 15, ...}      current depth per queue
+reg.snapshot()   # {"ingest": {...}, "categorize": {...}}    q.snapshot() per queue
 ```
 
 `pending()` returns a FIFO-ordered list of the currently-pending payloads
 for one queue (diagnostics only — don't drive control flow off it).
+
+## With a backing store (durable, crash-recoverable)
+
+To survive a restart, back each queue with a **projection** — a callable
+that returns the items that should currently be on the queue, by reading
+your durable state. The library holds no on-disk state of its own; your
+table is the source of truth, and `populate()` rebuilds the in-memory
+queue from the projection at boot (or as a self-heal sweep).
+
+Durable state here is a single `WORK` table: one row per item, `QUEUE`
+holds the item's current queue, `TIMESTAMP` gives FIFO order.
+
+```python
+import sqlite3
+from queuing import QueueRegistry
+
+reg = QueueRegistry()
+
+def projection(queue):
+    conn = sqlite3.connect("yourapp.db")
+    return [row[0] for row in conn.execute(
+        "SELECT id FROM WORK WHERE QUEUE = ? ORDER BY TIMESTAMP", (queue,)
+    )]
+
+# Pipeline: ingest -> categorize -> filter -> done, plus an error queue.
+for queue in ("ingest", "categorize", "filter", "done", "error"):
+    reg.register(queue, projection=lambda q=queue: projection(q))
+
+# Fill every queue from its projection at process start.
+reg.populate_all()
+
+# One worker body, reused per stage. `compute` does the app's writes;
+# `out` is the queue to advance to on success, "error" on failure.
+def run_worker(in_name, out_name, compute):
+    q_in = reg.get(in_name)
+    while not should_stop:
+        payload = q_in.dequeue()
+        if payload is None:
+            continue
+        conn = sqlite3.connect("yourapp.db", isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")         # open the txn FIRST
+        try:
+            compute(payload, conn)              # app's own writes
+            target = out_name                   # success -> next stage
+        except Exception:
+            conn.rollback()                     # discard the failed work
+            conn.execute("BEGIN IMMEDIATE")     # fresh txn for the routing move
+            target = "error"                    # failure -> error queue
+        conn.execute("UPDATE WORK SET QUEUE = ? WHERE id = ?", (target, payload))
+        conn.commit()                           # work + queue move land together
+        reg.get(target).enqueue(payload)        # notify whichever queue we moved to
+
+# Each stage runs in its own thread; both route failures to "error":
+run_worker("categorize", "filter", categorize)   # categorize -> filter | error
+run_worker("filter",     "done",   filter_)      # filter -> done | error
+```
+
+The transaction is opened **before** the compute call so the app's own
+writes and the queue move (`UPDATE WORK SET QUEUE = ...`) are one atomic
+unit. Either the item is fully processed AND advanced to the next queue,
+or neither happens — there's no window where the app state changed but the
+item is still parked on its source queue, nor one where it advanced
+without its work being done.
+
+On a caught exception the worker **rolls back the partial app writes**,
+opens a fresh transaction, and moves the item to the `error` queue
+instead of the next stage. That quarantines the bad item — it leaves
+`categorize`/`filter` so the pipeline doesn't reprocess it forever, and an
+error handler (or just an operator) can inspect, fix, and re-route it from
+`error`. If instead the process dies mid-flight (an *uncaught* failure),
+the open transaction rolls back with the on-disk `QUEUE` untouched, so the
+next restart re-derives the item onto its source queue via `populate()`
+and runs it again — which is why the compute must be idempotent.
+
+The in-memory `enqueue` happens only AFTER the commit: it's a notification
+that durable state has already advanced, never a substitute for it. A
+crash between commit and enqueue loses only the notification, which
+`populate()` rebuilds at restart.
+
+### Factory: build a registry from a queue-shaped table
+
+When your durable queue state lives in a table with a queue-name column
+(one row per queue item, queue assignment in that column), the
+`register_from_table` factory builds projections for every named queue
+in one call:
+
+```python
+import sqlite3
+from queuing import QueueRegistry
+
+conn = sqlite3.connect("yourapp.db")
+
+reg = QueueRegistry()
+reg.register_from_table(
+    conn,
+    table="WORK",
+    queue_names=["ingest", "categorize", "filter", "done"],
+    q_column="QUEUE",           # default is "q_name"
+    id_column="id",
+    where_extra=None,           # optional SQL appended to WHERE
+)
+reg.populate_all()
+queue = reg.get("categorize")
+```
+
+Each queue's projection is `SELECT <id_column> FROM <table> WHERE
+<q_column> = 'X' [AND <where_extra>]`. Items move between queues by the
+consumer's worker doing `UPDATE <table> SET <q_column>='<next>' WHERE …`
+in its own transaction — that commit IS the dequeue+enqueue.
+
+### What goes on the consumer's table
+
+The consumer's table carries the queue assignment in a column — the
+`QUEUE` column on `WORK` above. The minimum a row needs is an id, the
+current queue, and something to order by:
+
+```sql
+CREATE TABLE WORK (
+    id        INTEGER PRIMARY KEY,
+    QUEUE     TEXT,                  -- which queue this item is on (NULL = none)
+    TIMESTAMP REAL                   -- FIFO order within a queue
+    -- ... plus whatever columns your app's compute reads and writes
+);
+```
+
+Projection for queue `Y` is then just every row currently assigned to it,
+in order:
+
+```sql
+SELECT id FROM WORK WHERE QUEUE = 'Y' ORDER BY TIMESTAMP
+```
+
+A worker advances an item by updating that column inside its transaction
+(`UPDATE WORK SET QUEUE = '<next>' WHERE id = ?`), which is what the
+projection re-derives at the next restart. The `QUEUE` column can live on
+an existing table you already have — add it with
+`ALTER TABLE <your_table> ADD COLUMN QUEUE TEXT` — and the id/order
+columns can be any columns that uniquely identify and sequence a row
+(a primary key and a `seq`/`created_at`, say). Add a `WHERE` predicate to
+the projection to exclude already-finished rows when the same table holds
+terminal items.
+
+### Integrity
+
+All queue interaction goes through `QueueRegistry.get(name)`, which
+raises `KeyError` for unregistered names. Workers can neither enqueue
+to nor dequeue from a queue they didn't register. The registry is the
+contract for which queues exist; nothing outside it can address a queue.
+
+For forensic detection of pre-existing rows with retired queue names,
+call `detect_orphans(conn, table)` — returns a list of queue-name values
+present in the table but not registered. Decide what to do — log, alert,
+delete, migrate, ignore.
+
+## Running queue workers → qworkers
+
+The `run_worker` loop above — dequeue, process, route to the next queue or
+an error queue, retry on transient failures — is exactly what the
+companion [`qworkers`](../qworkers/README.md) package provides as a managed
+harness: one daemon thread per `(queue, process_fn)` pair, worker pools,
+clean start/stop/join lifecycle plus a context manager, an `error_queue`,
+and per-worker stats. Reach for it instead of hand-rolling the loop once
+you have more than one stage — see
+[`qworkers/README.md`](../qworkers/README.md).
 
 ## API reference
 
@@ -251,24 +378,11 @@ class QueuePriority:
                  dequeue_timeout: float | None = 1.0)
 ```
 
-Lower index in the constructor list = higher priority. A gated
-queue's blocking `dequeue()` yields its payload only when the queue
-has an item AND no higher-priority gated queue has items pending.
-Queues outside the gate are unaffected. Membership is fixed for
-process lifetime (no `detach`). Build the gate BEFORE starting any
-worker threads — attaching to a queue with a live blocked dequeue
-is unsupported.
-
 All payloads must be hashable with stable hashes — storage is an
 `OrderedDict` keyed by payload (insertion order = FIFO, key membership =
 O(1) dedup), so this is a library-wide requirement, gated or not.
 `enqueue()` does an explicit `hash(item)` before taking any lock, so an
 unhashable payload fails fast with `TypeError`.
-
-Workers running gated queues with `dequeue_timeout=None` need an
-external signal handler that calls `WorkerSystem.stop()` from the
-main thread; Python delivers SIGTERM only to the main thread and a
-worker parked in `cond.wait()` does not unblock on its own.
 
 ## Use as a git submodule
 
