@@ -44,6 +44,12 @@ NO_VERSION = "NOVERSION"
 CANONICAL_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)$")
 
 
+#: Parses any version tag into (component, version): group 1 is the component
+#: (``None`` for a bare ``X.x`` tag), group 2 the bare version. The greedy
+#: ``(.+)-`` lets component names contain hyphens (``server-side-2.1``).
+_ANY_VERSION_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+)$")
+
+
 def _version_tag_re(component: Optional[str]) -> "re.Pattern[str]":
     """Regex whose group 1 is the version, for a component's tags.
 
@@ -182,6 +188,35 @@ def latest_version_tag(
         if match:
             return match.group(1)
     return None
+
+
+def latest_versions(repo_root: Optional[Union[str, Path]] = None) -> "dict[Optional[str], str]":
+    """Map each component to its highest released version, from the repo's tags.
+
+    Scans every tag, parses ``<component>-<X.x>`` (and bare ``<X.x>``), and
+    keeps the highest version per component — the all-components overview that
+    :func:`latest_version_tag` gives for one. The bare lineage (tags with no
+    component) is keyed by ``None``. Returns an empty dict if there are no
+    version tags or git is unavailable.
+
+    Because ``git tag --sort=-version:refname`` orders by version semantics,
+    the first tag seen for a component is its highest, so one pass suffices.
+
+    Args:
+        repo_root: Path to the git repo. Defaults to the current directory.
+    """
+    cwd = str(repo_root) if repo_root is not None else None
+    out = _git(["tag", "--sort=-version:refname"], cwd)
+    result: "dict[Optional[str], str]" = {}
+    if not out:
+        return result
+    for line in out.splitlines():
+        match = _ANY_VERSION_TAG_RE.match(line.strip())
+        if not match:
+            continue
+        component, version = match.group(1), match.group(2)
+        result.setdefault(component, version)  # first seen = highest
+    return result
 
 
 def current_os() -> str:

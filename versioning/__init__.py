@@ -34,6 +34,7 @@ from .versioning import (
     canonical_version,
     current_os,
     latest_version_tag,
+    latest_versions,
 )
 
 __all__ = [
@@ -43,4 +44,5 @@ __all__ = [
     "canonical_version",
     "current_os",
     "latest_version_tag",
+    "latest_versions",
 ]

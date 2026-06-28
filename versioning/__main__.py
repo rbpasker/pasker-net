@@ -36,6 +36,8 @@ Options:
     -v, --verbose      print the derivation (component, base tag, branch,
                        commit, dirty) to stderr; stdout stays the bare result.
   mutually exclusive (default prints the canonical version):
+    --list             list every component's latest version, one per line
+                       (the bare lineage shows as `(bare)`)
     --build-number     instead print `git rev-list --count HEAD` (the
                        monotonic integer for Apple CFBundleVersion)
     --increment-major  print the next major version (major+1, minor=0) from
@@ -67,6 +69,8 @@ _DEFAULT_MAIN_BRANCHES = ("main", "master")
 _GIT_TIMEOUT_S = 2.0
 NO_VERSION = "NOVERSION"
 CANONICAL_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)$")
+# Parses any version tag into (component, version); component is None for bare.
+_ANY_VERSION_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+)$")
 
 # Generated artifacts of this versioning system; excluded from the dirty check
 # (the build rewrites them before the check runs). See versioning.py.
@@ -145,6 +149,20 @@ def build_number(cwd: Optional[str]) -> Optional[int]:
         return int(count)
     except ValueError:
         return None
+
+
+def latest_versions(cwd: Optional[str]):
+    # Highest released version per component (None key = bare lineage). Sorted
+    # by version, so the first tag seen for a component is its highest.
+    out = _git(["tag", "--sort=-version:refname"], cwd)
+    result = {}
+    if not out:
+        return result
+    for line in out.splitlines():
+        match = _ANY_VERSION_TAG_RE.match(line.strip())
+        if match:
+            result.setdefault(match.group(1), match.group(2))
+    return result
 # --------------------------- end inlined block -----------------------------
 
 
@@ -203,6 +221,9 @@ def main() -> int:
                     help="Print the derivation (component, base tag, branch, "
                          "commit, dirty) to stderr; stdout stays the bare result.")
     mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--list", action="store_true",
+                      help="List every component's latest version (one per line); "
+                           "the bare lineage shows as '(bare)'.")
     mode.add_argument("--build-number", action="store_true",
                       help="Instead print `git rev-list --count HEAD` "
                            "(the monotonic integer for Apple CFBundleVersion).")
@@ -219,6 +240,19 @@ def main() -> int:
 
     if args.verbose:
         _describe(cwd, component, sys.stderr)
+
+    if args.list:
+        versions = latest_versions(cwd)
+        if not versions:
+            print("(no version tags)")
+            return 0
+        named = sorted(c for c in versions if c is not None)
+        width = max((len(c) for c in named), default=6)
+        for comp in named:
+            print(f"{comp:<{width}}  {versions[comp]}")
+        if None in versions:
+            print(f"{'(bare)':<{width}}  {versions[None]}")
+        return 0
 
     if args.build_number:
         n = build_number(cwd)

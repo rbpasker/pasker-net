@@ -19,6 +19,7 @@ from versioning import (
     NO_VERSION,
     canonical_version,
     latest_version_tag,
+    latest_versions,
 )
 from versioning.__main__ import next_version
 
@@ -191,6 +192,39 @@ class ComponentTags(unittest.TestCase):
             self.assertEqual(next_version(repo, "minor", "server"), "server-0.1")
 
 
+class LatestVersionsListing(unittest.TestCase):
+    """latest_versions() gives the highest version per component."""
+
+    def test_highest_per_component_plus_bare(self) -> None:
+        with _TempRepo("queuing-1.0", "qworkers-1.0", "secretvault-1.0",
+                       "versioning-1.0", "0.9", "1.2") as repo:
+            self.assertEqual(latest_versions(repo), {
+                "queuing": "1.0",
+                "qworkers": "1.0",
+                "secretvault": "1.0",
+                "versioning": "1.0",
+                None: "1.2",          # bare lineage, highest of 0.9 / 1.2
+            })
+
+    def test_picks_version_sorted_max_within_component(self) -> None:
+        with _TempRepo("svc-1.9", "svc-1.10", "svc-2.0") as repo:
+            self.assertEqual(latest_versions(repo), {"svc": "2.0"})
+
+    def test_hyphenated_component_name(self) -> None:
+        # The greedy parse keeps hyphens in the component, splitting on the
+        # final `-<version>`.
+        with _TempRepo("server-side-2.1") as repo:
+            self.assertEqual(latest_versions(repo), {"server-side": "2.1"})
+
+    def test_ignores_non_version_tags(self) -> None:
+        with _TempRepo("nightly", "v1.0", "rc-2.0-beta") as repo:
+            self.assertEqual(latest_versions(repo), {})
+
+    def test_empty_repo(self) -> None:
+        with _TempRepo() as repo:
+            self.assertEqual(latest_versions(repo), {})
+
+
 class CanonicalVersionCaching(unittest.TestCase):
     """canonical_version memoizes by args; a process sees a stable snapshot."""
 
@@ -248,6 +282,16 @@ class IncrementCLI(unittest.TestCase):
             result = self._run(repo, "--component", "server", "--increment-major")
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout.strip(), "server-3.0")
+
+    def test_list_shows_every_component(self) -> None:
+        with _TempRepo("queuing-1.0", "versioning-2.0", "1.5") as repo:
+            result = self._run(repo, "--list")
+            self.assertEqual(result.returncode, 0)
+            lines = result.stdout.splitlines()
+            # Named components first (alphabetical), bare lineage last.
+            self.assertEqual(lines[0].split(), ["queuing", "1.0"])
+            self.assertEqual(lines[1].split(), ["versioning", "2.0"])
+            self.assertEqual(lines[-1].split(), ["(bare)", "1.5"])
 
 
 if __name__ == "__main__":

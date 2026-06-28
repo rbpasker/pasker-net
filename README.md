@@ -306,8 +306,9 @@ This repo's own modules are versioned per-component with the tool itself.
 It computes the next tag with
 `versioning --component <component> --increment-{major,minor}`, creates an
 annotated `<component>-<X.x>` tag on `HEAD`, pushes it to `origin`, and prints
-the resulting version (`-v`). With no prior tag, a major bump bootstraps to
-`1.0` and a minor bump to `0.1`.
+the resulting version (`-v`). A minor bump is `+.1` (`2.3 → 2.4`); a major bump
+is `+1` with minor reset (`2.3 → 3.0`). With no prior tag they bootstrap from
+`0.0`, so a first major bump lands at `1.0` and a first minor bump at `0.1`.
 
 ```bash
 ./release.sh secretvault major     # first release -> secretvault-1.0
@@ -316,12 +317,20 @@ the resulting version (`-v`). With no prior tag, a major bump bootstraps to
 
 Each module releases on its own lineage, so `queuing-1.0`, `qworkers-1.0`,
 `secretvault-1.0`, and `versioning-1.0` advance independently and never shadow
-each other. To read a module's current version, scope the query to its
-component:
+each other. `--list` shows every component's latest version at a glance:
+
+```bash
+$ python3 -m versioning --list
+queuing      1.0
+qworkers     1.0
+secretvault  1.0
+versioning   1.0
+```
+
+To read one module's live version, scope the query to its component (this is
+what a consumer that vendors a single module uses, via `--component` /
+`component=`):
 
 ```bash
 python3 -m versioning --component secretvault         # e.g. 1.0-4ed7dad
 ```
-
-A consumer that vendors a single module points `--component` / `component=` at
-that module's name to track the right lineage.
