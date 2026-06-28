@@ -293,3 +293,35 @@ $ versioning --component server
 
 Meanwhile `client` releases on its own `client-*` tags, never shadowing
 `server`.
+
+## Releasing
+
+This repo's own modules are versioned per-component with the tool itself.
+[`release.sh`](release.sh) wraps the increment-and-tag flow:
+
+```bash
+./release.sh <component> [major|minor]      # default bump: minor
+```
+
+It computes the next tag with
+`versioning --component <component> --increment-{major,minor}`, creates an
+annotated `<component>-<X.x>` tag on `HEAD`, pushes it to `origin`, and prints
+the resulting version (`-v`). With no prior tag, a major bump bootstraps to
+`1.0` and a minor bump to `0.1`.
+
+```bash
+./release.sh secretvault major     # first release -> secretvault-1.0
+./release.sh queuing minor         # next minor     -> queuing-1.1
+```
+
+Each module releases on its own lineage, so `queuing-1.0`, `qworkers-1.0`,
+`secretvault-1.0`, and `versioning-1.0` advance independently and never shadow
+each other. To read a module's current version, scope the query to its
+component:
+
+```bash
+python3 -m versioning --component secretvault         # e.g. 1.0-4ed7dad
+```
+
+A consumer that vendors a single module points `--component` / `component=` at
+that module's name to track the right lineage.
