@@ -112,6 +112,12 @@ python -m secretvault --service myapp delete ANTHROPIC_API_KEY
 python -m secretvault --service myapp list                       # all under service
 ```
 
+`set` and `delete` won't clobber an existing secret silently: if the key
+already exists they prompt for confirmation (or, when stdin isn't a TTY, refuse
+with a non-zero exit). Pass `--force`/`-f` to overwrite or delete without
+prompting. `import` likewise skips keys that already exist and reports them;
+`import --force` overwrites them.
+
 `default_vault()` returns `KeychainVault` on macOS, `EnvironmentVault`
 elsewhere. Service name namespaces the secrets — each consuming app
 passes its own (`"edmund"`, `"roscoe"`, etc.) so keys don't collide.
@@ -175,6 +181,9 @@ Notes:
   reason. Delete bundles when done.
 - Non-ASCII secret values round-trip as hex (a `security -w` quirk); ASCII
   secrets such as API keys/tokens are unaffected.
+- `import` does **not** overwrite keys already present in the target service —
+  it skips them and lists what it skipped. Re-run with `import --force` to
+  overwrite.
 
 ## versioning quick start
 

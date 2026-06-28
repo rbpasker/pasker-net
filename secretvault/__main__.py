@@ -18,6 +18,11 @@ Usage:
 (e.g. `--service edmund`, `--service roscoe`). For `set`, omit VALUE to
 be prompted with hidden input.
 
+Destructive operations require explicit intervention: `set` and `delete`
+prompt for confirmation when the key already exists (or refuse with a
+non-zero exit when stdin isn't a TTY), and `import` skips keys that already
+exist. Pass `--force`/`-f` to overwrite or delete without prompting.
+
 `export` / `import` move a whole service's secrets between machines (the
 Keychain itself doesn't sync to iCloud for command-line tools). `export`
 writes a JSON bundle to a file (mode 0600) or stdout; `import` reads it
@@ -101,6 +106,26 @@ class KeychainVault:
 
 def cmd_set(args: argparse.Namespace) -> int:
     vault = KeychainVault(service=args.service)
+    # Overwriting an existing secret is destructive (the old value is gone),
+    # so require explicit intervention when the key already exists: --force
+    # always overwrites; otherwise prompt (interactive) or refuse (non-tty).
+    # Check before asking for the value so the operator isn't made to type a
+    # secret only to have it refused.
+    if not args.force and vault.exists(args.key):
+        if sys.stdin.isatty():
+            resp = input(
+                f"'{args.key}' already exists (service={args.service}). Overwrite? [y/N] "
+            ).strip().lower()
+            if resp not in ("y", "yes"):
+                print("aborted; existing value left unchanged", file=sys.stderr)
+                return 1
+        else:
+            print(
+                f"error: '{args.key}' already exists (service={args.service}); "
+                f"pass --force to overwrite",
+                file=sys.stderr,
+            )
+            return 1
     if args.value is not None:
         value = args.value
     else:
@@ -126,6 +151,23 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 def cmd_delete(args: argparse.Namespace) -> int:
     vault = KeychainVault(service=args.service)
+    # Deleting is destructive too, so require intervention: --force always
+    # deletes; otherwise prompt (interactive) or refuse (non-tty).
+    if not args.force and vault.exists(args.key):
+        if sys.stdin.isatty():
+            resp = input(
+                f"delete '{args.key}' (service={args.service})? [y/N] "
+            ).strip().lower()
+            if resp not in ("y", "yes"):
+                print("aborted; nothing deleted", file=sys.stderr)
+                return 1
+        else:
+            print(
+                f"error: refusing to delete '{args.key}' (service={args.service}); "
+                f"pass --force to confirm",
+                file=sys.stderr,
+            )
+            return 1
     if vault.delete(args.key):
         print(f"deleted '{args.key}' (service={args.service})")
         return 0
@@ -268,8 +310,9 @@ def cmd_import(args: argparse.Namespace) -> int:
     """Load secrets from a JSON bundle (file, stdin, or heredoc) into the service.
 
     Accepts the `export` envelope ({"service":..,"secrets":{..}}) or a bare
-    {key: value} object for hand-rolled heredocs. Existing keys are updated
-    in place.
+    {key: value} object for hand-rolled heredocs. Keys that already exist are
+    left untouched and reported unless --force is given (overwriting a secret
+    discards its old value, so it takes explicit intervention).
     """
     if args.file and args.file != "-":
         raw = _read_maybe_root(args.file)
@@ -296,14 +339,21 @@ def cmd_import(args: argparse.Namespace) -> int:
 
     vault = KeychainVault(service=args.service)
     count = 0
+    skipped: list[str] = []
     for key, value in secrets.items():
         if not isinstance(value, str):
             print(f"skipping '{key}': value is not a string", file=sys.stderr)
+            continue
+        if not args.force and vault.exists(key):
+            skipped.append(key)
             continue
         vault.set(key, value)
         count += 1
     print(f"imported {count} secret(s) into service '{args.service}'",
           file=sys.stderr)
+    if skipped:
+        print(f"skipped {len(skipped)} existing key(s) (pass --force to overwrite): "
+              f"{', '.join(sorted(skipped))}", file=sys.stderr)
     return 0
 
 
@@ -337,6 +387,8 @@ def main() -> int:
     p.add_argument("key", help="Secret key")
     p.add_argument("value", nargs="?", default=None,
                    help="Secret value (prompts if omitted)")
+    p.add_argument("--force", "-f", action="store_true",
+                   help="overwrite an existing key without prompting")
     p.set_defaults(func=cmd_set)
 
     p = subs.add_parser("get", help="Retrieve a secret")
@@ -345,6 +397,8 @@ def main() -> int:
 
     p = subs.add_parser("delete", help="Delete a secret")
     p.add_argument("key", help="Secret key")
+    p.add_argument("--force", "-f", action="store_true",
+                   help="delete without prompting")
     p.set_defaults(func=cmd_delete)
 
     p = subs.add_parser("exists", help="Check if a secret exists")
@@ -364,6 +418,8 @@ def main() -> int:
     p = subs.add_parser("import", help="Import secrets from JSON (file, stdin, or heredoc)")
     p.add_argument("file", nargs="?", default=None,
                    help="Input file; omit or '-' to read stdin")
+    p.add_argument("--force", "-f", action="store_true",
+                   help="overwrite keys that already exist (default: skip them)")
     p.set_defaults(func=cmd_import)
 
     args = parser.parse_args()
