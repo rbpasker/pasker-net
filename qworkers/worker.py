@@ -37,12 +37,20 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 from queuing import QueueRegistry
 
 log = logging.getLogger(__name__)
+
+# E is the entry/payload type carried by the queues (Edmund's queues
+# carry str instruction ids); C is the per-thread connection type
+# produced by `conn_factory`. Process functions receive `C | None`
+# because a WorkerSystem built without a conn_factory passes None.
+E = TypeVar("E")
+C = TypeVar("C")
 
 
 class TransientException(Exception):
@@ -62,13 +70,15 @@ class TransientException(Exception):
 
 # A process function takes (entry, conn) and returns the next queue's
 # name, a list of next-queue names (fan-out), or None (terminal).
-# Routing is the worker's job; process is pure logic.
-ProcessFn = Callable[[Any, Any], "str | list[str] | None"]
+# Routing is the worker's job; process is pure logic. `conn` is
+# `C | None`: None is what workers pass when no conn_factory is
+# configured.
+ProcessFn = Callable[[E, "C | None"], "str | list[str] | None"]
 
 
 # An observer is called with (event, qname, item) for every worker-
 # driven enqueue or dequeue. event is "enq" or "deq".
-ObserverFn = Callable[[str, str, Any], None]
+ObserverFn = Callable[[str, str, E], None]
 
 
 class LoggerObserver:
@@ -93,7 +103,7 @@ class LoggerObserver:
         self._log = logger if logger is not None else logging.getLogger("qworkers")
         self._level = level
 
-    def __call__(self, event: str, qname: str, item: Any) -> None:
+    def __call__(self, event: str, qname: str, item: object) -> None:
         self._log.log(self._level, "%s %s %r", event, qname, item)
 
 
@@ -135,7 +145,16 @@ class WorkerStats:
         return self.service_total_s / n if n else 0.0
 
 
-class WorkerSystem:
+@runtime_checkable
+class _SupportsClose(Protocol):
+    """Structural `close()` check for worker-thread connections. The
+    runtime-checkable isinstance is the typed equivalent of
+    `hasattr(conn, "close")` — it only tests for the attribute."""
+
+    def close(self) -> object: ...
+
+
+class WorkerSystem(Generic[E, C]):
     """Run a thread per (qname, process) pair against a QueueRegistry.
 
     Lifecycle: `start()` spawns the threads, `stop()` signals shutdown
@@ -146,12 +165,12 @@ class WorkerSystem:
 
     def __init__(
         self,
-        pairs: list[tuple[str, ProcessFn]],
+        pairs: list[tuple[str, ProcessFn[E, C]]],
         *,
-        registry: QueueRegistry | None = None,
-        conn_factory: Callable[[], Any] | None = None,
+        registry: QueueRegistry[E] | None = None,
+        conn_factory: Callable[[], C] | None = None,
         error_queue: str | None = None,
-        observer: ObserverFn | None = None,
+        observer: ObserverFn[E] | None = None,
         wait_timeout: float = 1.0,
     ) -> None:
         """
@@ -185,8 +204,10 @@ class WorkerSystem:
         wait_timeout: how long a worker blocks in dequeue() before
                       re-checking the stop flag.
         """
-        self._pairs = list(pairs)
-        self._registry = registry if registry is not None else QueueRegistry()
+        self._pairs: list[tuple[str, ProcessFn[E, C]]] = list(pairs)
+        self._registry: QueueRegistry[E] = (
+            registry if registry is not None else QueueRegistry()
+        )
         self._conn_factory = conn_factory
         self._error_queue = error_queue
         self._observer = observer
@@ -215,7 +236,7 @@ class WorkerSystem:
         self._stats_lock = threading.Lock()
 
     @property
-    def registry(self) -> QueueRegistry:
+    def registry(self) -> QueueRegistry[E]:
         return self._registry
 
     # ----- lifecycle ----------------------------------------------------
@@ -261,11 +282,16 @@ class WorkerSystem:
         for t in self._threads:
             t.join(timeout=timeout)
 
-    def __enter__(self) -> "WorkerSystem":
+    def __enter__(self) -> "WorkerSystem[E, C]":
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
         # Best-effort clean shutdown. If we're exiting because of an
         # exception in the body, we still want to bring workers down.
         self.stop(join_timeout=self._wait_timeout * 2)
@@ -273,7 +299,7 @@ class WorkerSystem:
 
     # ----- worker loop --------------------------------------------------
 
-    def _observe(self, event: str, qname: str, item: Any) -> None:
+    def _observe(self, event: str, qname: str, item: E) -> None:
         """Fire the observer callback, isolating its exceptions so a
         buggy observer can't break a worker."""
         if self._observer is None:
@@ -283,7 +309,9 @@ class WorkerSystem:
         except Exception:
             log.exception("observer raised on %s %s %r", event, qname, item)
 
-    def _worker_loop(self, qname: str, process: ProcessFn, index: int) -> None:
+    def _worker_loop(
+        self, qname: str, process: ProcessFn[E, C], index: int,
+    ) -> None:
         q = self._registry.get(qname)
         conn = self._conn_factory() if self._conn_factory is not None else None
         log.info("qworker:%s#%d started", qname, index)
@@ -348,7 +376,7 @@ class WorkerSystem:
                     else:  # transient
                         stats.transient_failure_count += 1
         finally:
-            if conn is not None and hasattr(conn, "close"):
+            if conn is not None and isinstance(conn, _SupportsClose):
                 try:
                     conn.close()
                 except Exception:

@@ -28,22 +28,35 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
-from typing import Any, Generic, TypeVar
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from enum import Enum, auto
+from typing import Final, Generic, Protocol, TypeGuard, TypeVar, runtime_checkable
 
 T = TypeVar("T")
 
+# Row-value TypeVars for the DB-API protocol below. `V_co` is the
+# protocol's own (covariant — it only appears in return position);
+# `V` is the free variable used by functions that accept the protocol.
+V = TypeVar("V")
+V_co = TypeVar("V_co", covariant=True)
+
 log = logging.getLogger(__name__)
+
 
 # Sentinel for `Queue.dequeue(timeout=...)` to distinguish "caller did
 # not pass a timeout, use the queue's configured default" from
 # "caller explicitly passed timeout=None, block forever". `None` already
 # means "block forever" (matches threading.Event.wait), so we need a
-# different sentinel for "use default".
-_UNSET = object()
+# different sentinel for "use default". A single-member Enum (rather
+# than `object()`) so type checkers can narrow `timeout is _UNSET`.
+class _UnsetType(Enum):
+    UNSET = auto()
 
 
-# Test-only hook fired inside `_dequeue_gated`, between `_allowed()`
+_UNSET: Final = _UnsetType.UNSET
+
+
+# Test-only hook fired inside `_dequeue_gated`, between `allowed()`
 # returning True and the `popitem(last=False)` that takes the item.
 # Tests monkey-patch this to inject a race (e.g., enqueue something
 # higher-priority while a worker is committed to popping). Production:
@@ -54,7 +67,7 @@ _TEST_HOOK_AFTER_ALLOWED: "Callable[[], None] | None" = None
 # ---------------------------- Stats ----------------------------------- #
 
 
-class Stats(dict):
+class Stats(dict[str, float]):
     """Dict subclass with `inc`/`dec`/`add`/`sub`/`set` counter helpers.
 
     Per-key tracking of the running sum AND the min/max of the
@@ -74,8 +87,15 @@ class Stats(dict):
     falling back to scalar when either bound is missing. GIGO: `set`
     accepts any value, and `inc` after `set("k", "string")` will raise."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        seed: Mapping[str, float] | Iterable[tuple[str, float]] = (),
+        /,
+        **kwargs: float,
+    ) -> None:
+        super().__init__(seed)
+        if kwargs:
+            self.update(kwargs)
         # Per-key min/max of the INCREMENTS passed to inc/dec/add/sub.
         # `+inf` / `-inf` are the no-data sentinels: any real value
         # beats `+inf` as a candidate min and `-inf` as a candidate
@@ -116,7 +136,7 @@ class Stats(dict):
         self[k] = self.get(k, 0) - n
         self._track(k, -n)
 
-    def set(self, k: str, v: Any) -> None:
+    def set(self, k: str, v: float) -> None:
         self[k] = v
         # An absolute write voids any tracked min/max/count — those
         # describe the increments, not the new value.
@@ -124,7 +144,7 @@ class Stats(dict):
         self._max.pop(k, None)
         self._n.pop(k, None)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> dict[str, float | tuple[float, float, float, int]]:
         """Coherent shallow copy. Each tracked key becomes a 4-tuple
         `(value, min, max, count)` summarising the increments observed via
         inc/dec/add/sub since the key was last `set` (or since process
@@ -134,7 +154,7 @@ class Stats(dict):
         key may be incremented zero or many times per item, which is what
         makes `value / deq` fall outside [min, max]. Each untracked key
         (pre-seeded or written by `set`) is its scalar value."""
-        out: dict[str, Any] = {}
+        out: dict[str, float | tuple[float, float, float, int]] = {}
         for k, v in self.items():
             mn = self._min.get(k)
             mx = self._max.get(k)
@@ -151,8 +171,16 @@ class Stats(dict):
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _is_nonempty_str(x: object) -> bool:
+    """Runtime guard for callers outside the typed world. Lives behind
+    a function boundary (input domain: any object) so the isinstance
+    stays live under strict type checking, where the call sites' typed
+    parameters would otherwise make it an always-true check."""
+    return isinstance(x, str) and bool(x)
+
+
 def _validate_ident(value: str, label: str) -> str:
-    if not isinstance(value, str) or not _IDENT_RE.match(value):
+    if not _is_nonempty_str(value) or not _IDENT_RE.match(value):
         raise ValueError(
             f"invalid SQL identifier for {label}: {value!r} "
             "(must match /^[A-Za-z_][A-Za-z0-9_]*$/)"
@@ -160,20 +188,48 @@ def _validate_ident(value: str, label: str) -> str:
     return value
 
 
-def _coerce_conn_or_factory(conn_or_factory: Any) -> Callable[[], Any]:
-    """Normalize a connection-or-factory argument to a zero-arg callable
-    that returns a DB-API connection.
+@runtime_checkable
+class SupportsExecute(Protocol[V_co]):
+    """Minimal DB-API connection surface used by the projection
+    factories: `execute(sql[, parameters])` returning an iterable of
+    rows. `sqlite3.Connection` satisfies it. Generic in the row value
+    type so `register_from_table` can type the ids it projects."""
 
+    def execute(
+        self, sql: str, parameters: tuple[str, ...] = ..., /
+    ) -> Iterable[Sequence[V_co]]: ...
+
+
+def _is_connection(
+    x: SupportsExecute[V] | Callable[[], SupportsExecute[V]],
+) -> TypeGuard[SupportsExecute[V]]:
+    """True when `x` is a live connection rather than a factory.
     `callable()` is the wrong predicate for distinguishing the two —
     sqlite3.Connection is itself callable (it aliases to .cursor()) —
-    so we detect connections by the presence of `.execute`.
-    """
-    if hasattr(conn_or_factory, "execute"):
+    so we detect connections by the presence of `.execute` (which is
+    exactly what the runtime-checkable protocol isinstance checks)."""
+    return isinstance(x, SupportsExecute)
+
+
+def _is_factory(
+    x: SupportsExecute[V] | Callable[[], SupportsExecute[V]],
+) -> TypeGuard[Callable[[], SupportsExecute[V]]]:
+    return callable(x)
+
+
+def _coerce_conn_or_factory(
+    conn_or_factory: SupportsExecute[V] | Callable[[], SupportsExecute[V]],
+) -> Callable[[], SupportsExecute[V]]:
+    """Normalize a connection-or-factory argument to a zero-arg callable
+    that returns a DB-API connection. Connections are detected first
+    (see `_is_connection`); anything else callable is taken as a
+    factory."""
+    if _is_connection(conn_or_factory):
         _conn = conn_or_factory
-        def get_conn():
+        def get_conn() -> SupportsExecute[V]:
             return _conn
         return get_conn
-    if callable(conn_or_factory):
+    if _is_factory(conn_or_factory):
         return conn_or_factory
     raise TypeError(
         f"expected a DB-API connection or zero-arg callable returning one, "
@@ -206,7 +262,7 @@ class Queue(Generic[T]):
         *,
         dequeue_timeout: float | None = None,
     ) -> None:
-        if not name or not isinstance(name, str):
+        if not _is_nonempty_str(name):
             raise ValueError(
                 f"queue name must be a non-empty string, got {name!r}"
             )
@@ -237,21 +293,21 @@ class Queue(Generic[T]):
         # Wake-up signal for blocked ungated dequeues. Sticky
         # threading.Event: a set() before a wait() is not lost — the
         # wait returns immediately. Set by ungated enqueue and wake().
-        # Gated paths use gate._cond, not this Event.
+        # Gated paths use gate.cond, not this Event.
         self._ready = threading.Event()
         # Set by wake(); consumed by the next dequeue that finds the
         # queue empty so the caller (typically a worker checking a
         # stop flag) gets a None return instead of looping back into
         # another wait. Cleared whenever consumed.
         self._wake_pending = False
-        # Set by QueuePriority via _attach_gate. None = ungated.
-        self._gate: "QueuePriority | None" = None
+        # Set by QueuePriority via attach_gate. None = ungated.
+        self._gate: "QueuePriority[T] | None" = None
 
     # ----- gate attach ---------------------------------------------------
 
-    def _attach_gate(
+    def attach_gate(
         self,
-        gate: "QueuePriority",
+        gate: "QueuePriority[T]",
         dequeue_timeout: float | None,
     ) -> None:
         """Called once by QueuePriority.__init__ for each member queue.
@@ -284,9 +340,9 @@ class Queue(Generic[T]):
             # self._ready is not cleared — gated path ignores it.
             self._gate = gate  # last write — flips routing
 
-    def _len_locked(self) -> int:
+    def len_locked(self) -> int:
         """Caller MUST hold the right lock (self._lock if ungated,
-        self._gate._cond if gated)."""
+        self._gate.cond if gated)."""
         return len(self._items)
 
     # ----- producer side -------------------------------------------------
@@ -313,7 +369,7 @@ class Queue(Generic[T]):
             self.stats.inc("enq")
             self._ready.set()
             return True
-        cond = self._gate._cond
+        cond = self._gate.cond
         with cond:
             if item in self._items:
                 return False
@@ -335,7 +391,7 @@ class Queue(Generic[T]):
             self.stats.inc("enq")
             self._ready.set()
             return True
-        cond = self._gate._cond
+        cond = self._gate.cond
         with cond:
             if item in self._items:
                 return False
@@ -347,7 +403,7 @@ class Queue(Generic[T]):
 
     # ----- consumer side -------------------------------------------------
 
-    def dequeue(self, timeout: float | None = _UNSET) -> T | None:  # type: ignore[assignment]
+    def dequeue(self, timeout: float | None | _UnsetType = _UNSET) -> T | None:
         """Block until an item is available, then return its payload.
 
         `timeout` semantics:
@@ -369,11 +425,12 @@ class Queue(Generic[T]):
         gate's configured `dequeue_timeout` is only the default when
         the caller omits the argument.
         """
-        if self._gate is None:
+        gate = self._gate
+        if gate is None:
             return self._dequeue_ungated(timeout)
-        return self._dequeue_gated(timeout)
+        return self._dequeue_gated(timeout, gate)
 
-    def _dequeue_ungated(self, timeout: Any) -> T | None:
+    def _dequeue_ungated(self, timeout: float | None | _UnsetType) -> T | None:
         eff = self._dequeue_timeout if timeout is _UNSET else timeout
         deadline = (time.monotonic() + eff) if (eff is not None and eff > 0) else None
         while True:
@@ -403,10 +460,14 @@ class Queue(Generic[T]):
                 remaining = None
             self._ready.wait(timeout=remaining)
 
-    def _dequeue_gated(self, timeout: Any) -> T | None:
+    def _dequeue_gated(
+        self,
+        timeout: float | None | _UnsetType,
+        gate: "QueuePriority[T]",
+    ) -> T | None:
         eff = self._dequeue_timeout if timeout is _UNSET else timeout
         deadline = (time.monotonic() + eff) if (eff is not None and eff > 0) else None
-        cond = self._gate._cond  # type: ignore[union-attr]
+        cond = gate.cond
         payload: T
         enq_ts: float
         with cond:
@@ -418,7 +479,7 @@ class Queue(Generic[T]):
                 if self._wake_pending:
                     self._wake_pending = False
                     return None
-                if self._items and self._gate._allowed(self):  # type: ignore[union-attr]
+                if self._items and gate.allowed(self):
                     if _TEST_HOOK_AFTER_ALLOWED is not None:
                         _TEST_HOOK_AFTER_ALLOWED()
                     payload, enq_ts = self._items.popitem(last=False)
@@ -445,11 +506,16 @@ class Queue(Generic[T]):
                 self._wake_pending = True
             self._ready.set()
             return
-        with self._gate._cond:
+        with self._gate.cond:
             self._wake_pending = True
-            self._gate._cond.notify_all()
+            self._gate.cond.notify_all()
 
     # ----- projection / boot recovery -----------------------------------
+
+    def has_projection(self) -> bool:
+        """True when this queue was constructed with (or later given)
+        a projection, i.e. `populate()` can be called with no args."""
+        return self._projection is not None
 
     def populate(
         self,
@@ -492,7 +558,7 @@ class Queue(Generic[T]):
                 self.stats.add("enq", added)
                 self._ready.set()
             return added
-        cond = self._gate._cond
+        cond = self._gate.cond
         with cond:
             for item in items:
                 if item in self._items:
@@ -510,10 +576,10 @@ class Queue(Generic[T]):
         if self._gate is None:
             with self._lock:
                 return len(self._items)
-        with self._gate._cond:
+        with self._gate.cond:
             return len(self._items)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> dict[str, float]:
         """Return a flat dict copy of `self.stats` with derived keys
         folded in:
 
@@ -533,7 +599,7 @@ class Queue(Generic[T]):
         `deq` as its (correct, per-item) average denominator.
         """
         raw = self.stats.snapshot()
-        s: dict[str, Any] = {}
+        s: dict[str, float] = {}
         for k, v in raw.items():
             if isinstance(v, tuple) and len(v) == 4:
                 value, mn, mx, n = v
@@ -567,14 +633,14 @@ class Queue(Generic[T]):
         if self._gate is None:
             with self._lock:
                 return list(self._items)
-        with self._gate._cond:
+        with self._gate.cond:
             return list(self._items)
 
 
 # ---------------------------- QueuePriority --------------------------- #
 
 
-class QueuePriority:
+class QueuePriority(Generic[T]):
     """Static-priority gate over a set of named queues. Lower index in
     the constructor list = higher priority. A gated queue's blocking
     dequeue() yields its payload only when this queue is at the top of
@@ -589,25 +655,25 @@ class QueuePriority:
 
     def __init__(
         self,
-        queues: list[Queue],
+        queues: list[Queue[T]],
         *,
         dequeue_timeout: float | None = 1.0,
     ) -> None:
-        self._queues: list[Queue] = list(queues)
+        self._queues: list[Queue[T]] = list(queues)
         self._prio: dict[str, int] = {q.name: i for i, q in enumerate(queues)}
-        self._cond = threading.Condition()
+        self.cond = threading.Condition()
         for q in queues:
-            q._attach_gate(self, dequeue_timeout)
+            q.attach_gate(self, dequeue_timeout)
 
-    def _allowed(self, q: Queue) -> bool:
-        """Caller MUST hold self._cond. True iff no higher-priority
+    def allowed(self, q: Queue[T]) -> bool:
+        """Caller MUST hold self.cond. True iff no higher-priority
         gated queue has items pending. O(N) over the gate's members
         (N ≤ ~10 expected); each member contributes one O(1) len read."""
         my = self._prio[q.name]
         for other in self._queues:
             if other is q:
                 continue
-            if other._len_locked() > 0 and self._prio[other.name] < my:
+            if other.len_locked() > 0 and self._prio[other.name] < my:
                 return False
         return True
 
@@ -615,7 +681,7 @@ class QueuePriority:
 # ---------------------------- Registry -------------------------------- #
 
 
-class QueueRegistry:
+class QueueRegistry(Generic[T]):
     """A named collection of Queues, with bulk boot-population. Use when
     the consuming system has a fixed set of named queues (one per
     pipeline stage, one per executor):
@@ -628,14 +694,14 @@ class QueueRegistry:
     """
 
     def __init__(self) -> None:
-        self._queues: dict[str, Queue] = {}
+        self._queues: dict[str, Queue[T]] = {}
         self._lock = threading.Lock()
 
     def register(
         self,
         name: str,
-        projection: Callable[[], Iterable] | None = None,
-    ) -> Queue:
+        projection: Callable[[], Iterable[T]] | None = None,
+    ) -> Queue[T]:
         """Register a queue by name. If a queue with this name already
         exists, return it (idempotent)."""
         with self._lock:
@@ -645,7 +711,7 @@ class QueueRegistry:
             self._queues[name] = q
             return q
 
-    def get(self, name: str) -> Queue:
+    def get(self, name: str) -> Queue[T]:
         """Return the queue registered under `name`. Raises KeyError if
         not registered."""
         with self._lock:
@@ -668,7 +734,7 @@ class QueueRegistry:
             queues = list(self._queues.items())
         out: dict[str, int] = {}
         for name, q in queues:
-            if q._projection is None:
+            if not q.has_projection():
                 continue
             out[name] = q.populate()
         return out
@@ -679,7 +745,7 @@ class QueueRegistry:
             queues = list(self._queues.items())
         return {name: len(q) for name, q in queues}
 
-    def snapshot(self) -> dict[str, dict[str, Any]]:
+    def snapshot(self) -> dict[str, dict[str, float]]:
         """`{queue_name: q.snapshot()}` for every registered queue. The
         per-queue dict carries built-in counters (`enq`/`deq`/
         `wait_total_s`), derived `depth` and `wait_avg_s`, and any
@@ -690,14 +756,14 @@ class QueueRegistry:
 
     def register_from_table(
         self,
-        conn_or_factory: Any,
+        conn_or_factory: SupportsExecute[T] | Callable[[], SupportsExecute[T]],
         table: str,
         queue_names: Iterable[str],
         *,
         q_column: str = "q_name",
         id_column: str = "id",
         where_extra: str | None = None,
-    ) -> list[Queue]:
+    ) -> list[Queue[T]]:
         """Register one Queue per name in `queue_names`, each backed by a
         projection over `table`. The projection per queue X is:
 
@@ -739,7 +805,7 @@ class QueueRegistry:
         if not names:
             raise ValueError("queue_names must be non-empty")
         for n in names:
-            if not isinstance(n, str) or not n:
+            if not _is_nonempty_str(n):
                 raise ValueError(
                     f"queue name must be a non-empty string, got {n!r}"
                 )
@@ -750,12 +816,12 @@ class QueueRegistry:
         if where_extra:
             sql = f"{sql} AND ({where_extra})"
 
-        registered: list[Queue] = []
+        registered: list[Queue[T]] = []
         for name in names:
-            def make_projection(qn: str) -> Callable[[], list]:
+            def make_projection(qn: str) -> Callable[[], list[T]]:
                 # Late-binding guard: capture `qn` as a default arg so
                 # each closure binds the right queue name.
-                def projection(_qn=qn):
+                def projection(_qn: str = qn) -> list[T]:
                     return [row[0] for row in get_conn().execute(sql, (_qn,))]
                 return projection
             q = self.register(name, projection=make_projection(name))
@@ -764,7 +830,7 @@ class QueueRegistry:
 
     def detect_orphans(
         self,
-        conn_or_factory: Any,
+        conn_or_factory: SupportsExecute[str] | Callable[[], SupportsExecute[str]],
         table: str,
         *,
         q_column: str = "q_name",
@@ -804,4 +870,4 @@ class QueueRegistry:
 
 # ---------------------------- Public API ------------------------------ #
 
-__all__ = ["Queue", "QueuePriority", "QueueRegistry", "Stats"]
+__all__ = ["Queue", "QueuePriority", "QueueRegistry", "Stats", "SupportsExecute"]
