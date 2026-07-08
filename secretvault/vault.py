@@ -23,6 +23,8 @@ loader; consumers compose this however they like.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import platform
 import subprocess
@@ -33,6 +35,50 @@ from abc import ABC, abstractmethod
 # "look this up in the vault by the same key." Kept here as a public
 # constant so callers don't have to hard-code the string.
 SECRET_SENTINEL = "SECRET"
+
+
+# ----------------------------- Keychain encoding ---------------------------- #
+# macOS `security -w` does NOT round-trip every value: if a stored password
+# contains a newline (or any non-ASCII / control byte), `find-generic-password
+# -w` hands it back HEX-ENCODED instead of verbatim — silently corrupting a
+# multi-line secret like a PEM private key. To keep get() == set() for ALL str
+# values, such values are stored base64-encoded behind a marker prefix and
+# decoded on read. Single-line printable-ASCII values (the common case) are
+# stored verbatim, so secrets written by older versions still read back
+# unchanged (backward-compatible).
+_B64_MARKER = "secretvault$b64$1$"
+
+
+def _keychain_safe(value: str) -> bool:
+    """True iff `security -w` returns `value` verbatim. It hex-encodes any
+    newline / non-ASCII / control byte, and `get()` strips surrounding
+    whitespace, so a value survives as-is only when it is printable ASCII with
+    no leading/trailing whitespace."""
+    return value.isascii() and value.isprintable() and value == value.strip()
+
+
+def _encode_for_keychain(value: str) -> str:
+    """Storage form: verbatim when keychain-safe, else marker + base64 — a
+    single line of ASCII that `security -w` returns intact."""
+    if _keychain_safe(value):
+        return value
+    return _B64_MARKER + base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _decode_from_keychain(raw: str) -> str:
+    """Inverse of `_encode_for_keychain`. `security -w` appends a trailing
+    newline, so strip first (historical behavior). A leading marker means the
+    payload is base64; if it doesn't decode cleanly it wasn't our encoding, so
+    fall back to the raw value."""
+    raw = raw.strip()
+    if raw.startswith(_B64_MARKER):
+        try:
+            return base64.b64decode(
+                raw[len(_B64_MARKER):], validate=True
+            ).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return raw
+    return raw
 
 
 class SecretVault(ABC):
@@ -79,17 +125,20 @@ class KeychainVault(SecretVault):
                  "-s", self._service, "-a", key, "-w"],
                 capture_output=True, text=True, check=True,
             )
-            return result.stdout.strip()
+            return _decode_from_keychain(result.stdout)
         except subprocess.CalledProcessError:
             return None
 
     def set(self, key: str, value: str) -> None:
         # `-U` updates in place if the entry exists. We don't pre-delete
         # because that would invalidate any application that's already
-        # been granted Keychain access to the entry.
+        # been granted Keychain access to the entry. Multi-line / non-ASCII
+        # values are base64-wrapped so `security -w` round-trips them (see
+        # `_encode_for_keychain`).
         subprocess.run(
             ["security", "add-generic-password",
-             "-s", self._service, "-a", key, "-w", value, "-U"],
+             "-s", self._service, "-a", key, "-w",
+             _encode_for_keychain(value), "-U"],
             capture_output=True, check=True,
         )
 

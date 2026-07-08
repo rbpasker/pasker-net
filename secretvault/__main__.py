@@ -16,7 +16,9 @@ Usage:
 
 `--service` is required so secrets are namespaced to one consuming app
 (e.g. `--service edmund`, `--service roscoe`). For `set`, omit VALUE to
-be prompted with hidden input.
+be prompted with hidden input, or pass `--file PATH` to read the value
+verbatim from a file (the way to store a multi-line secret like a PEM
+private key without it landing in your shell history).
 
 Destructive operations require explicit intervention: `set` and `delete`
 prompt for confirmation when the key already exists (or refuse with a
@@ -39,11 +41,44 @@ back from a file, a pipe, or a heredoc:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import getpass
 import json
 import os
 import subprocess
 import sys
+
+
+# Keychain value encoding — inlined to keep this CLI self-contained. macOS
+# `security -w` returns a stored value HEX-ENCODED (not verbatim) when it
+# contains a newline / non-ASCII / control byte, corrupting multi-line secrets
+# like a PEM key. So such values are stored base64 behind a marker and decoded
+# on read; single-line printable-ASCII values are stored verbatim (backward-
+# compatible). Keep in sync with secretvault/vault.py.
+_B64_MARKER = "secretvault$b64$1$"
+
+
+def _keychain_safe(value: str) -> bool:
+    return value.isascii() and value.isprintable() and value == value.strip()
+
+
+def _encode_for_keychain(value: str) -> str:
+    if _keychain_safe(value):
+        return value
+    return _B64_MARKER + base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _decode_from_keychain(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith(_B64_MARKER):
+        try:
+            return base64.b64decode(
+                raw[len(_B64_MARKER):], validate=True
+            ).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return raw
+    return raw
 
 
 # KeychainVault is inlined (rather than imported from secretvault.vault) so
@@ -69,15 +104,17 @@ class KeychainVault:
                  "-s", self._service, "-a", key, "-w"],
                 capture_output=True, text=True, check=True,
             )
-            return result.stdout.strip()
+            return _decode_from_keychain(result.stdout)
         except subprocess.CalledProcessError:
             return None
 
     def set(self, key: str, value: str) -> None:
-        # `-U` updates in place if the entry exists.
+        # `-U` updates in place if the entry exists. Multi-line / non-ASCII
+        # values are base64-wrapped so `security -w` round-trips them.
         subprocess.run(
             ["security", "add-generic-password",
-             "-s", self._service, "-a", key, "-w", value, "-U"],
+             "-s", self._service, "-a", key, "-w",
+             _encode_for_keychain(value), "-U"],
             capture_output=True, check=True,
         )
 
@@ -126,7 +163,23 @@ def cmd_set(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-    if args.value is not None:
+    if args.file is not None and args.value is not None:
+        print("error: pass either VALUE or --file, not both", file=sys.stderr)
+        return 1
+    if args.file is not None:
+        # Read the file VERBATIM (no strip) so a multi-line secret — e.g. a PEM
+        # private key — round-trips byte-for-byte. The Keychain layer
+        # base64-wraps it transparently (see _encode_for_keychain).
+        try:
+            with open(args.file, "r", encoding="utf-8") as fh:
+                value = fh.read()
+        except OSError as exc:
+            print(f"error: cannot read --file {args.file!r}: {exc}", file=sys.stderr)
+            return 1
+        if not value:
+            print(f"error: --file {args.file!r} is empty", file=sys.stderr)
+            return 1
+    elif args.value is not None:
         value = args.value
     else:
         value = getpass.getpass(f"Enter value for '{args.key}' (service={args.service}): ")
@@ -387,6 +440,9 @@ def main() -> int:
     p.add_argument("key", help="Secret key")
     p.add_argument("value", nargs="?", default=None,
                    help="Secret value (prompts if omitted)")
+    p.add_argument("--file", "-F", default=None, metavar="PATH",
+                   help="read the value verbatim from a file (preserves "
+                        "newlines — for multi-line secrets like a PEM key)")
     p.add_argument("--force", "-f", action="store_true",
                    help="overwrite an existing key without prompting")
     p.set_defaults(func=cmd_set)
