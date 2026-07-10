@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit a self-contained Swift namespace mirroring ``canonical_version``.
+"""Emit a self-contained Swift namespace mirroring ``canonical_version_client``.
 
 Intended to be invoked from an Xcode "Run Script" build phase that lists
 the output path as one of the phase's outputs, so the generated file is
@@ -16,7 +16,9 @@ The emitted file declares an ``enum`` (Swift's idiomatic namespace) with:
     everywhere (works on iOS / iPadOS / tvOS / watchOS / visionOS /
     macOS / Catalyst with zero platform-specific imports) and a
     compile-time ``#if os(…)`` for the platform name
-  * ``build`` — ``<app>[-<branch>]-<commit>[-dirty]``
+  * ``build`` — ``<app>-<revNumber>`` clean; a dirty build appends
+    ``[-<branch>]-dirty (<buildTime>)`` (a Zulu-time stamp). Mirrors the Python
+    ``canonical_version_client`` (rev, no commit hash).
   * ``full`` — ``<build> (<os>)``
 
 Note: ``#if os(iOS)`` is true on iPad as well — Swift has no
@@ -42,7 +44,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Allow running as a script without installing the package.
@@ -64,7 +66,7 @@ enum {type_name} {{
     /// CFBundleVersion / CURRENT_PROJECT_VERSION at release.
     static let revNumber = {rev_number}
 
-    /// Wall-clock build time, baked **only for dirty builds** (empty otherwise,
+    /// Zulu (UTC) build time, baked **only for dirty builds** (empty otherwise,
     /// so a clean build regenerates byte-identically). A clean build's time is
     /// recoverable from its commit; a dirty build has no commit to point at.
     static let buildTime = "{build_time}"
@@ -141,7 +143,7 @@ def emit(
     rev = rev if rev is not None else 0
     # Buildtime is baked ONLY for dirty builds; clean builds leave it empty so
     # the generated file is byte-identical across rebuilds (idempotent).
-    build_time = datetime.now().astimezone().isoformat(timespec="minutes") if dirty else ""
+    build_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ") if dirty else ""
     return _TEMPLATE.format(
         type_name=type_name,
         git_branch=_swift_escape(branch),

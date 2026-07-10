@@ -17,11 +17,15 @@ from pathlib import Path
 from versioning import (
     CANONICAL_VERSION_RE,
     NO_VERSION,
+    VersionParts,
     canonical_version,
+    canonical_version_client,
     latest_version_tag,
     latest_versions,
+    parse_canonical_version,
 )
 from versioning.__main__ import next_version
+from versioning.versioning import _build  # the format renderer, for round-trips
 
 # Root holding the importable `versioning` package, for `-m versioning` runs.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -294,6 +298,78 @@ class IncrementCLI(unittest.TestCase):
             self.assertEqual(lines[0].split(), ["queuing", "1.0", head])
             self.assertEqual(lines[1].split(), ["versioning", "2.0", head])
             self.assertEqual(lines[-1].split(), ["(bare)", "1.5", head])
+
+
+class BuildParseRoundTrip(unittest.TestCase):
+    """`_build` and `parse_canonical_version` are inverses. Fixtures are the
+    actual format strings, so the nondeterministic dirty build-time just rides
+    in the input (no clock in the test)."""
+
+    # server/client × clean/dirty × trunk/branch, plus a dirty build with no OS.
+    _STRINGS = [
+        "2.0-767-50a5c3b (macOS-26.1)",                          # server clean trunk
+        "2.0-767-feat-50a5c3b (macOS-26.1)",                     # server clean branch
+        "2.0-767-50a5c3b-dirty (macOS-26.1)",                    # server dirty trunk
+        "2.0-767-feat-50a5c3b-dirty (macOS-26.1)",               # server dirty branch
+        "1.0-767 (iOS-26.5.1)",                                  # client clean
+        "1.0-767-dirty (2026-07-10T21:00Z) (iOS-26.5.1)",        # client dirty trunk
+        "1.0-767-feat-dirty (2026-07-10T21:00Z) (iOS-26.5.1)",   # client dirty branch
+        "1.0-767-dirty (2026-07-10T21:00Z)",                     # client dirty, no OS
+    ]
+
+    def test_string_roundtrip(self) -> None:
+        # verstring == _build(_parse(verstring))
+        for s in self._STRINGS:
+            with self.subTest(s=s):
+                self.assertEqual(s, _build(parse_canonical_version(s)))
+
+    def test_parts_roundtrip(self) -> None:
+        # _parse(_build(parts)) == parts, for parts _build renders faithfully.
+        for p in (
+            VersionParts("2.0", None, 767, "50a5c3b", False, None, "macOS-26.1"),
+            VersionParts("2.0", "feat", 767, "50a5c3b", False, None, "macOS-26.1"),
+            VersionParts("2.0", "feat", 767, "50a5c3b", True, None, "macOS-26.1"),
+            VersionParts("1.0", None, 767, None, False, None, "iOS-26.5.1"),
+            VersionParts("1.0", "feat", 767, None, True, "2026-07-10T21:00Z", "iOS-26.5.1"),
+            VersionParts("1.0", None, 767, None, True, "2026-07-10T21:00Z", None),
+        ):
+            with self.subTest(p=p):
+                self.assertEqual(parse_canonical_version(_build(p)), p)
+
+    def test_parse_pins_semantics(self) -> None:
+        # Round-trip alone can't catch a consistent-but-wrong split — pin meaning.
+        p = parse_canonical_version("2.0-767-50a5c3b (macOS-26.1)")
+        self.assertEqual((p.app_version, p.rev_number, p.commit, p.branch),
+                         ("2.0", 767, "50a5c3b", None))
+        self.assertFalse(p.dirty)
+        self.assertEqual(p.os_version, "macOS-26.1")
+        c = parse_canonical_version("1.0-767-feat-dirty (2026-07-10T21:00Z) (iOS-26.5.1)")
+        self.assertEqual((c.rev_number, c.commit, c.branch, c.dirty), (767, None, "feat", True))
+        self.assertEqual((c.build_time, c.os_version), ("2026-07-10T21:00Z", "iOS-26.5.1"))
+
+
+class CanonicalVersionForms(unittest.TestCase):
+    """The two public functions against a real one-commit repo (rev == 1)."""
+
+    def tearDown(self) -> None:
+        canonical_version.cache_clear()
+        canonical_version_client.cache_clear()
+
+    def test_server_form_has_rev_and_commit(self) -> None:
+        with _TempRepo("2.0") as repo:
+            head = _git(repo, "rev-parse", "--short", "HEAD")
+            p = parse_canonical_version(
+                canonical_version("2.0", repo_root=repo, os_version="macOS-99"))
+            # Branch-agnostic (a non-main default branch would just add a branch):
+            self.assertEqual((p.app_version, p.rev_number, p.commit, p.os_version),
+                             ("2.0", 1, head, "macOS-99"))
+
+    def test_client_form_has_rev_but_no_commit(self) -> None:
+        with _TempRepo("2.0") as repo:
+            p = parse_canonical_version(
+                canonical_version_client("2.0", repo_root=repo, os_version="iOS-99"))
+            self.assertEqual((p.app_version, p.rev_number, p.commit, p.os_version),
+                             ("2.0", 1, None, "iOS-99"))
 
 
 if __name__ == "__main__":

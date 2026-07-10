@@ -27,8 +27,9 @@ import functools
 import platform
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 _DEFAULT_MAIN_BRANCHES = ("main", "master")
 _GIT_TIMEOUT_S = 2.0
@@ -64,6 +65,153 @@ def _version_tag_re(component: Optional[str]) -> "re.Pattern[str]":
     return re.compile(r"^" + re.escape(component) + r"-(\d+(?:\.\d+)+)$")
 
 
+class VersionParts(NamedTuple):
+    """The decomposed pieces of a canonical version string. :func:`_build`
+    renders these into a string and :func:`parse_canonical_version` recovers
+    them from one — the two are inverses. Fields absent from a given form are
+    None/False: ``commit`` is None for the client form; ``build_time`` is set
+    only for a dirty client build; ``branch`` is populated only when the build
+    is dirty (a clean build is identified by its rev + commit, so the branch is
+    omitted). ``_asdict()`` gives a plain dict of the pieces."""
+    app_version: str
+    branch: Optional[str] = None
+    rev_number: Optional[int] = None
+    commit: Optional[str] = None
+    dirty: bool = False
+    build_time: Optional[str] = None
+    os_version: Optional[str] = None
+
+
+def _build(parts: VersionParts) -> str:
+    """Render a :class:`VersionParts` into the canonical string — the SINGLE
+    place the format is defined, so :func:`canonical_version`,
+    :func:`canonical_version_client`, and the Swift emitter's mirror can't
+    drift. Layout:
+
+        ``<app>[-<rev>][-<branch>][-<commit>][-dirty][ (<build_time>)][ (<os>)]``
+
+    The branch renders whenever it is present in ``parts`` — :func:`_gather`
+    decides presence per form (server: any non-trunk; client: only when dirty).
+    ``commit`` distinguishes the server form from the client form; ``build_time``
+    (a dirty client build; a Zulu-time ISO stamp) rides in its own parens before
+    the OS suffix."""
+    segs = [parts.app_version]
+    if parts.rev_number is not None:
+        segs.append(str(parts.rev_number))
+    if parts.branch:
+        segs.append(parts.branch)
+    if parts.commit:
+        segs.append(parts.commit)
+    if parts.dirty:
+        segs.append("dirty")
+    out = "-".join(segs)
+    if parts.build_time:
+        out += f" ({parts.build_time})"
+    if parts.os_version:
+        out += f" ({parts.os_version})"
+    return out
+
+
+# A commit segment is a short/full hex SHA; a rev segment is decimal digits.
+# A build_time is a Zulu-time ISO stamp (distinct in shape from an OS tag like
+# "macOS-26.1"), so parse_canonical_version can classify a trailing "(…)" group
+# by shape rather than position — robust even when the OS suffix is absent.
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_BUILD_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z$")
+_TRAILING_PAREN_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
+
+
+def parse_canonical_version(version: str) -> VersionParts:
+    """Reverse of :func:`_build`: decompose a canonical version STRING back into
+    its :class:`VersionParts`. For a version that arrived from elsewhere (e.g. a
+    health check reading a server's ``/api/version``, where the local repo isn't
+    the one that produced the string), so :func:`_gather` — which reads local
+    git — can't help.
+
+    Best-effort, anchored on the reliable pieces: the leading ``X.x`` app, a
+    digit rev, a hex commit, a trailing ``-dirty``, and the parenthesised
+    build-time / OS. It round-trips every string :func:`_build` produces. A
+    branch name that is itself all-hex-or-digits could be mis-split — acceptable
+    for the display/telemetry use this serves, not for security."""
+    s = version
+    os_version: Optional[str] = None
+    build_time: Optional[str] = None
+    # Peel up to two trailing "(…)" groups, classifying EACH by shape: a
+    # Zulu-time ISO stamp is the build_time, anything else is the OS tag. Shape,
+    # not position — so a lone group (a dirty build with no OS suffix) still
+    # classifies correctly.
+    for _ in range(2):
+        m = _TRAILING_PAREN_RE.search(s)
+        if m is None:
+            break
+        group = m.group(1)
+        if _BUILD_TIME_RE.match(group):
+            build_time = group
+        else:
+            os_version = group
+        s = s[: m.start()]
+    dirty = s.endswith("-dirty")
+    if dirty:
+        s = s[: -len("-dirty")]
+    app_version, _, rest = s.partition("-")
+    branch: Optional[str] = None
+    rev_number: Optional[int] = None
+    commit: Optional[str] = None
+    if rest:
+        segs = rest.split("-")
+        if segs and segs[0].isdigit():
+            rev_number = int(segs[0])
+            segs = segs[1:]
+        if segs and _COMMIT_RE.match(segs[-1]):
+            commit = segs[-1]
+            segs = segs[:-1]
+        if segs:
+            branch = "-".join(segs)
+    return VersionParts(
+        app_version=app_version, branch=branch, rev_number=rev_number,
+        commit=commit, dirty=dirty, build_time=build_time, os_version=os_version,
+    )
+
+
+def _gather(
+    app_version: Optional[str], repo_root: Optional[Union[str, Path]],
+    main_branches: tuple[str, ...], os_version: Optional[str],
+    component: Optional[str], *, with_commit: bool, with_build_time: bool,
+) -> VersionParts:
+    """Read local git state into a :class:`VersionParts`. ``with_commit``
+    includes the short HEAD hash (server form); ``with_build_time`` stamps a
+    Zulu-time build stamp on a DIRTY build (client form — a dirty build has no
+    commit to point at). The branch is kept per form so the parts match what
+    :func:`_build` renders (and the reverse parse round-trips): the SERVER form
+    keeps it on any non-trunk branch; the CLIENT form only when dirty."""
+    cwd = str(repo_root) if repo_root is not None else None
+    if app_version is None:
+        app_version = latest_version_tag(repo_root, component) or NO_VERSION
+    commit = _git(["rev-parse", "--short", "HEAD"], cwd) if with_commit else None
+    if with_commit and commit is None:  # git unavailable / not a repo
+        return VersionParts(app_version=app_version, commit="unknown", os_version=os_version)
+    rev = build_number(cwd)
+    if not with_commit and rev is None:
+        return VersionParts(app_version=app_version, commit="unknown", os_version=os_version)
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    dirty = _is_dirty(cwd)
+    on_named_branch = bool(branch and branch != "HEAD" and branch not in main_branches)
+    build_time = (
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        if with_build_time and dirty else None
+    )
+    return VersionParts(
+        app_version=app_version,
+        # Server (with_commit): shown on any non-trunk. Client: only when dirty.
+        branch=branch if (on_named_branch and (with_commit or dirty)) else None,
+        rev_number=rev,
+        commit=commit,
+        dirty=dirty,
+        build_time=build_time,
+        os_version=os_version,
+    )
+
+
 @functools.lru_cache(maxsize=None)
 def canonical_version(
     app_version: Optional[str] = None,
@@ -73,60 +221,43 @@ def canonical_version(
     os_version: Optional[str] = None,
     component: Optional[str] = None,
 ) -> str:
-    """Return ``<app_version>[-<branch>]-<commit>[-dirty][ (<os_version>)]``.
+    """The SERVER canonical form: ``<app>[-<rev>][-<branch>]-<commit>[-dirty][ (<os>)]``
+    — e.g. ``2.0-767-50a5c3b (macOS-26.1)``. Keeps the commit hash for exact
+    identification (``-dirty`` alone flags an unclean tree; the commit already
+    pins the base). See :func:`canonical_version_client` for the Apple/iOS form
+    (rev, no hash) and :func:`parse_canonical_version` to reverse either.
 
-    Args:
-        app_version: The app's semantic version, e.g. ``"1.3"``. When
-            ``None`` (the default), the base is derived from the repo's
-            latest version tag (:func:`latest_version_tag`); if there is no
-            tag, or the latest tag isn't in canonical format
-            (:data:`CANONICAL_VERSION_RE`), it falls back to
-            :data:`NO_VERSION` (``"NOVERSION"``). Drives the version off
-            ``git tag``.
-        repo_root: Path to the git repo. Defaults to the current working
-            directory.
-        main_branches: Branch names that suppress the branch infix. Defaults
-            to ``("main", "master")``.
-        os_version: Optional runtime OS tag (e.g. ``"macOS-14.5"``). When
-            non-None and non-empty, appended as `` (<os_version>)``. Use
-            :func:`current_os` for a sensible default on the host.
-        component: When set, the derived base comes from this component's
-            tags only (``<component>-<X.x>``, e.g. ``server-2.1``), so
-            sibling components don't shadow each other. Ignored when
-            ``app_version`` is given. The component scopes which tag is read;
-            it is *not* added to the returned string.
+    ``app_version`` defaults to the repo's latest version tag (falling back to
+    :data:`NO_VERSION`); ``component`` scopes which tag lineage is read;
+    ``os_version`` (e.g. from :func:`current_os`) appends `` (<os>)``. Falls
+    back to ``f"{app_version}-unknown"`` when git is unavailable. Cached by args
+    (a stable per-process snapshot); ``cache_clear()`` forces a re-read."""
+    return _build(_gather(
+        app_version, repo_root, main_branches, os_version, component,
+        with_commit=True, with_build_time=False,
+    ))
 
-    Returns:
-        Canonical version string. Falls back to ``f"{app_version}-unknown"``
-        (still followed by the OS suffix if given) if git can't be invoked
-        or the path isn't a repo.
 
-    The result is cached (``functools.lru_cache``) keyed by the arguments, so
-    a version shown many times in one process shells out to git only once.
-    The version is treated as a snapshot for the process's lifetime: if git
-    state changes afterwards (a new commit, the tree going dirty), the cached
-    value is intentionally stable. Call ``canonical_version.cache_clear()`` to
-    force a fresh read. (All arguments must be hashable for caching —
-    ``main_branches`` is a tuple for this reason; pass ``repo_root`` as a
-    ``str`` or ``Path``, both of which hash.)
-    """
-    cwd = str(repo_root) if repo_root is not None else None
-    if app_version is None:
-        app_version = latest_version_tag(repo_root, component) or NO_VERSION
-    commit = _git(["rev-parse", "--short", "HEAD"], cwd)
-    if commit is None:
-        return _with_os(f"{app_version}-unknown", os_version)
-
-    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
-    dirty = _is_dirty(cwd)
-
-    parts = [app_version]
-    if branch and branch != "HEAD" and branch not in main_branches:
-        parts.append(branch)
-    parts.append(commit)
-    if dirty:
-        parts.append("dirty")
-    return _with_os("-".join(parts), os_version)
+@functools.lru_cache(maxsize=None)
+def canonical_version_client(
+    app_version: Optional[str] = None,
+    repo_root: Optional[Union[str, Path]] = None,
+    *,
+    main_branches: tuple[str, ...] = _DEFAULT_MAIN_BRANCHES,
+    os_version: Optional[str] = None,
+    component: Optional[str] = None,
+) -> str:
+    """The CLIENT / Apple canonical form:
+    ``<app>[-<rev>][-<branch>][-dirty][ (<build_time>)][ (<os>)]`` — e.g.
+    ``1.0-767 (iOS-26.5.1)``. No commit hash (matches ``CFBundleVersion``'s
+    ``<X.x> (<rev>)`` and the Swift ``CanonicalVersion.full`` from
+    ``emit_swift.py``); a DIRTY build appends a wall-clock ``build_time`` in
+    place of the absent commit. Same args and caching as
+    :func:`canonical_version`."""
+    return _build(_gather(
+        app_version, repo_root, main_branches, os_version, component,
+        with_commit=False, with_build_time=True,
+    ))
 
 
 def build_number(repo_root: Optional[Union[str, Path]] = None) -> Optional[int]:
@@ -271,7 +402,3 @@ def _is_dirty(cwd: Optional[str]) -> bool:
         ["status", "--porcelain", "--untracked-files=no", "--", ".", *_GENERATED_EXCLUDES],
         cwd,
     ))
-
-
-def _with_os(base: str, os_version: Optional[str]) -> str:
-    return f"{base} ({os_version})" if os_version else base
