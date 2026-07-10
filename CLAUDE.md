@@ -18,6 +18,25 @@ Any consumer may need to change it, and different consumers may be pinned to
   vendored copy silently diverged from origin — that's invisible to every other
   consumer.
 
+## Releasing a component (version bump)
+
+Each module is versioned independently by **component-scoped git tags**
+(`<component>-<X.x>`, e.g. `versioning-1.1`, `secretvault-1.0`) so a bump to one
+never shadows another. Cut a release with `release.sh`, which uses the
+`versioning` tool itself to compute the next number from the existing tags:
+
+```sh
+./release.sh <component> [major|minor]     # default bump: minor
+./release.sh versioning minor              # versioning-1.1 -> versioning-1.2
+./release.sh secretvault major             # first release -> secretvault-1.0
+```
+
+It tags the current `HEAD` and pushes the tag to origin. So: **land the change
+first** (commit to `main` here, or PR+merge from a vendored copy), then run
+`release.sh` on `main` — a tag on an unmerged branch would strand on a
+squash-merge. **Bump the version whenever you change a component's behavior**
+(e.g. a new function or an output-format change), so consumers can pin to it.
+
 ## Other rules
 
 - **A vendored copy may be pinned to an OLD commit.** Before concluding a
