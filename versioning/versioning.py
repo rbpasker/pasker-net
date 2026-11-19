@@ -260,6 +260,36 @@ def canonical_version_client(
     ))
 
 
+def _short(app_version: str, seq: Optional[int], dirty: bool) -> str:
+    """Render ``M.m-seq[+]`` — the SINGLE place the short format is defined
+    (used by :func:`short_version` and :func:`short_from_canonical`). A missing
+    ``seq`` renders as ``unknown``; ``NOVERSION`` has no dots, so it is kept
+    whole."""
+    mm = ".".join(app_version.split(".")[:2])
+    if seq is None:
+        return f"{mm}-unknown"
+    return f"{mm}-{seq}" + ("+" if dirty else "")
+
+
+def short_from_canonical(version: str) -> str:
+    """Derive the short form ``M.m-seq[+]`` from a canonical version STRING
+    (either form; via :func:`parse_canonical_version`). It is the reference a
+    port of the short form (Swift, a CLI copy, a client) can be tested against.
+
+    Edge cases (the contract):
+
+    * ``"0.7-63-9151ff8-dirty"`` -> ``"0.7-63+"`` (server, dirty)
+    * ``"2.0.1-3-abc1234 (macOS-26.1)"`` -> ``"2.0-3"`` (patch dropped, OS/hash dropped)
+    * ``"1.0-767-feat-dirty (2026-11-19T14:29Z)"`` -> ``"1.0-767+"`` (client dirty)
+    * ``"2.0"`` (bare tag, no rev) -> ``"2.0-unknown"`` — no sequence to show
+    * ``"NOVERSION-46-c7caad6"`` -> ``"NOVERSION-46"`` (no ``M.m`` to cut)
+    * ``"NOVERSION-unknown"`` -> ``"NOVERSION-unknown"`` (git unavailable)
+    * ``"2.0-unknown"`` -> ``"2.0-unknown"``
+    """
+    p = parse_canonical_version(version)
+    return _short(p.app_version, p.rev_number, p.dirty)
+
+
 @functools.lru_cache(maxsize=None)
 def short_version(
     app_version: Optional[str] = None,
@@ -277,11 +307,8 @@ def short_version(
     cwd = str(repo_root) if repo_root is not None else None
     if app_version is None:
         app_version = latest_version_tag(repo_root, component) or NO_VERSION
-    mm = ".".join(app_version.split(".")[:2])
     seq = build_number(cwd)
-    if seq is None:
-        return f"{mm}-unknown"
-    return f"{mm}-{seq}" + ("+" if _is_dirty(cwd) else "")
+    return _short(app_version, seq, seq is not None and _is_dirty(cwd))
 
 
 def build_number(repo_root: Optional[Union[str, Path]] = None) -> Optional[int]:

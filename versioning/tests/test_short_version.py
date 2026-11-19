@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from versioning import canonical_version, short_version
+from versioning import (canonical_version, canonical_version_client,
+                        short_from_canonical, short_version)
 from versioning.__main__ import canonical_version as cli_canonical_version
 from versioning.__main__ import short_version as cli_short_version
 from versioning.tests.test_canonical_version_format import PROJECT_ROOT, _git, _TempRepo
@@ -72,6 +73,40 @@ class ShortVersion(unittest.TestCase):
                 self.assertEqual(
                     cli_canonical_version(repo),
                     canonical_version(repo_root=repo))
+
+
+class ShortFromCanonical(unittest.TestCase):
+    CASES = {
+        "0.7-63-9151ff8-dirty": "0.7-63+",
+        "0.7-63-9151ff8": "0.7-63",
+        "2.0.1-3-abc1234 (macOS-26.1)": "2.0-3",
+        "2.0-3-feature-abc1234-dirty (macOS-26.1)": "2.0-3+",
+        "1.0-767 (iOS-26.5.1)": "1.0-767",
+        "1.0-767-feat-dirty (2026-11-19T14:29Z) (iOS-26.5)": "1.0-767+",
+        "1.0-767-dirty (2026-11-19T14:29Z)": "1.0-767+",
+        "2.0": "2.0-unknown",                       # bare tag: no seq
+        "10.4.1": "10.4-unknown",
+        "NOVERSION-46-c7caad6": "NOVERSION-46",
+        "NOVERSION-46-c7caad6-dirty": "NOVERSION-46+",
+        "NOVERSION-unknown": "NOVERSION-unknown",   # git unavailable
+        "2.0-unknown": "2.0-unknown",
+    }
+
+    def test_cases(self) -> None:
+        for given, want in self.CASES.items():
+            with self.subTest(given=given):
+                self.assertEqual(short_from_canonical(given), want)
+
+    def test_agrees_with_short_version_for_real_repos(self) -> None:
+        for dirty in (False, True):
+            with _TempRepo("2.0.1") as repo:
+                if dirty:
+                    (Path(repo) / "a").write_text("changed\n")
+                want = short_version(repo_root=repo)
+                self.assertEqual(
+                    short_from_canonical(canonical_version(repo_root=repo)), want)
+                self.assertEqual(
+                    short_from_canonical(canonical_version_client(repo_root=repo)), want)
 
 
 if __name__ == "__main__":

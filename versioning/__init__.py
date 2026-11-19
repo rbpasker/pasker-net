@@ -25,7 +25,8 @@ STRING back into a :class:`VersionParts` (``._asdict()`` for a plain dict), for
 a version received from elsewhere (a health check reading ``/api/version``).
 
 :func:`short_version` is the compact display form ``M.m-seq[+]``
-(``"2.0-767"``; trailing ``+`` = dirty).
+(``"2.0-767"``; trailing ``+`` = dirty); :func:`short_from_canonical`
+derives it from a canonical string, as the reference for ports to test against.
 
 When ``app_version`` is omitted, the base is taken from the repo's latest
 version tag (``latest_version_tag``), so releases are cut with ``git tag``
@@ -54,6 +55,7 @@ from .versioning import (
     latest_version_tag,
     latest_versions,
     parse_canonical_version,
+    short_from_canonical,
     short_version,
 )
 
@@ -68,5 +70,6 @@ __all__ = [
     "latest_version_tag",
     "latest_versions",
     "parse_canonical_version",
+    "short_from_canonical",
     "short_version",
 ]
