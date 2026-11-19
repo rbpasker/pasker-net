@@ -448,7 +448,11 @@ def current_os() -> str:
     return f"{system}-{platform.release()}"
 
 
-def _git(args: list[str], cwd: Optional[str]) -> Optional[str]:
+def _git_raw(args: list[str], cwd: Optional[str]) -> Optional[str]:
+    """Run git; return its stripped stdout (``""`` when it succeeded with no
+    output) or ``None`` when git FAILED (not installed, non-zero exit, timeout).
+    The distinction matters to callers where empty output means something —
+    see :func:`_is_dirty`."""
     cmd = ["git"]
     if cwd is not None:
         cmd += ["-C", cwd]
@@ -459,7 +463,13 @@ def _git(args: list[str], cwd: Optional[str]) -> Optional[str]:
         )
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() or None
+    return result.stdout.strip()
+
+
+def _git(args: list[str], cwd: Optional[str]) -> Optional[str]:
+    # Success-with-no-output and failure both collapse to None here; use
+    # _git_raw when they must be told apart.
+    return _git_raw(args, cwd) or None
 
 
 # Generated artifacts of THIS versioning system. They are tracked (a committed
@@ -481,7 +491,10 @@ def _is_dirty(cwd: Optional[str]) -> bool:
     #   * the `_GENERATED_EXCLUDES` pathspecs drop this system's own generated
     #     stamp files, which the build rewrites before this check runs.
     # Empty output ⇔ no tracked source modifications.
-    return bool(_git(
+    #   * If git FAILS (timeout, error) we cannot know the tree is clean, so it
+    #     counts as DIRTY: a build must never claim "clean" when git didn't answer.
+    out = _git_raw(
         ["status", "--porcelain", "--untracked-files=no", "--", ".", *_GENERATED_EXCLUDES],
         cwd,
-    ))
+    )
+    return out is None or bool(out)

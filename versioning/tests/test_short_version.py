@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from versioning import (canonical_version, canonical_version_client,
@@ -173,6 +174,38 @@ class DevelopmentPreviewsNextMinor(unittest.TestCase):
             _commit(repo, "b")
             self.assertEqual(short_version(repo_root=repo).split("-")[0],
                              next_version(repo, "minor"))
+
+
+class GitFailureIsNotClean(unittest.TestCase):
+    """If `git status` fails, the tree must read as dirty, never clean."""
+
+    @staticmethod
+    def _failing_status():
+        real = subprocess.run
+
+        def run(cmd, *a, **kw):
+            if "status" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 2.0)
+            return real(cmd, *a, **kw)
+        return mock.patch("subprocess.run", side_effect=run)
+
+    def test_library_forms(self) -> None:
+        with _TempRepo("2.0") as repo:
+            with self._failing_status():
+                self.assertEqual(short_version("2.0", repo_root=repo), "2.0-1+")
+                self.assertTrue(canonical_version("2.0", repo_root=repo).endswith("-dirty"))
+                self.assertIn("-dirty", canonical_version_client("2.0", repo_root=repo))
+
+    def test_cli_copy(self) -> None:
+        with _TempRepo("2.0") as repo:
+            with self._failing_status():
+                self.assertEqual(cli_short_version(repo), "2.0-1+")
+                self.assertTrue(cli_canonical_version(repo).endswith("-dirty"))
+
+    def test_success_with_empty_output_still_clean(self) -> None:
+        with _TempRepo("2.0") as repo:
+            self.assertEqual(short_version("2.0", repo_root=repo), "2.0-1")
+            self.assertEqual(cli_short_version(repo), "2.0-1")
 
 
 if __name__ == "__main__":

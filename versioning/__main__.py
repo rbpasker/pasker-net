@@ -92,7 +92,7 @@ def _version_tag_re(component: Optional[str]):
     return re.compile(r"^" + re.escape(component) + r"-(\d+(?:\.\d+)+)$")
 
 
-def _git(args: List[str], cwd: Optional[str]) -> Optional[str]:
+def _git_raw(args: List[str], cwd: Optional[str]) -> Optional[str]:
     cmd = ["git"]
     if cwd is not None:
         cmd += ["-C", cwd]
@@ -103,14 +103,20 @@ def _git(args: List[str], cwd: Optional[str]) -> Optional[str]:
         )
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() or None
+    return result.stdout.strip()
+
+
+def _git(args: List[str], cwd: Optional[str]) -> Optional[str]:
+    return _git_raw(args, cwd) or None
 
 
 def _is_dirty(cwd: Optional[str]) -> bool:
-    return bool(_git(
+    # A git FAILURE counts as dirty — never claim "clean" when git didn't answer.
+    out = _git_raw(
         ["status", "--porcelain", "--untracked-files=no", "--", ".", *_GENERATED_EXCLUDES],
         cwd,
-    ))
+    )
+    return out is None or bool(out)
 
 
 def latest_version_tag(cwd: Optional[str], component: Optional[str] = None) -> Optional[str]:
