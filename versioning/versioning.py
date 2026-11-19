@@ -29,12 +29,26 @@ import functools
 import platform
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Optional, Union
 
 _DEFAULT_MAIN_BRANCHES = ("main", "master")
-_GIT_TIMEOUT_S = 2.0
+_GIT_TIMEOUT_S = 5.0
+#: A timed-out git call is retried (a loaded machine — e.g. a parallel build —
+#: can stall it past the timeout); after this many attempts a STRICT call raises
+#: :class:`GitError` instead of reporting "nothing found".
+_GIT_ATTEMPTS = 3
+
+
+class GitError(RuntimeError):
+    """git did not answer (timed out on every retry) for a lookup whose
+    "nothing found" result would be indistinguishable from a real answer — the
+    tag lookup (would read as ``NOVERSION``) and the ahead-of-tag check. Raised
+    rather than letting a transient stall publish a wrong version. A repo that
+    simply isn't one, or a missing git binary, are NOT this: they keep the
+    documented ``unknown`` fallback."""
 
 #: Base version used when no canonical version tag is available.
 NO_VERSION = "NOVERSION"
@@ -199,7 +213,7 @@ def _resolve_app_version(
         return NO_VERSION
     cwd = str(repo_root) if repo_root is not None else None
     ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
-    since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd)
+    since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd, strict=True)
     if since is not None and since.isdigit() and int(since) > 0:
         return _next_minor(tag)
     return tag
@@ -385,7 +399,9 @@ def latest_version_tag(
     still the bare version with the ``<component>-`` prefix stripped — so
     sibling components (``server`` / ``client``) keep separate lineages.
 
-    Returns ``None`` if no matching tag exists or git is unavailable.
+    Returns ``None`` if no matching tag exists or git is unavailable. If git
+    TIMES OUT (after retries) it raises :class:`GitError` — a stalled lookup is
+    not the same answer as "no tags".
 
     Args:
         repo_root: Path to the git repo. Defaults to the current directory.
@@ -394,7 +410,7 @@ def latest_version_tag(
     """
     cwd = str(repo_root) if repo_root is not None else None
     pattern = _version_tag_re(component)
-    out = _git(["tag", "--sort=-version:refname"], cwd)
+    out = _git(["tag", "--sort=-version:refname"], cwd, strict=True)
     if not out:
         return None
     for line in out.splitlines():
@@ -420,7 +436,7 @@ def latest_versions(repo_root: Optional[Union[str, Path]] = None) -> "dict[Optio
         repo_root: Path to the git repo. Defaults to the current directory.
     """
     cwd = str(repo_root) if repo_root is not None else None
-    out = _git(["tag", "--sort=-version:refname"], cwd)
+    out = _git(["tag", "--sort=-version:refname"], cwd, strict=True)
     result: "dict[Optional[str], str]" = {}
     if not out:
         return result
@@ -448,28 +464,40 @@ def current_os() -> str:
     return f"{system}-{platform.release()}"
 
 
-def _git_raw(args: list[str], cwd: Optional[str]) -> Optional[str]:
+def _git_raw(args: list[str], cwd: Optional[str], *, strict: bool = False) -> Optional[str]:
     """Run git; return its stripped stdout (``""`` when it succeeded with no
     output) or ``None`` when git FAILED (not installed, non-zero exit, timeout).
     The distinction matters to callers where empty output means something —
-    see :func:`_is_dirty`."""
+    see :func:`_is_dirty`.
+
+    A TIMEOUT is retried (``_GIT_ATTEMPTS`` times, short backoff); a definite
+    failure (non-zero exit, no git binary) is not. With ``strict=True`` a call
+    that timed out on every attempt raises :class:`GitError` instead of
+    returning ``None``."""
     cmd = ["git"]
     if cwd is not None:
         cmd += ["-C", cwd]
     cmd += args
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=_GIT_TIMEOUT_S,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip()
+    for attempt in range(_GIT_ATTEMPTS):
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=_GIT_TIMEOUT_S,
+            )
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        except subprocess.TimeoutExpired:
+            if attempt + 1 < _GIT_ATTEMPTS:
+                time.sleep(0.25 * (attempt + 1))
+    if strict:
+        raise GitError(f"git {' '.join(args)} timed out after {_GIT_ATTEMPTS} attempts")
+    return None
 
 
-def _git(args: list[str], cwd: Optional[str]) -> Optional[str]:
+def _git(args: list[str], cwd: Optional[str], *, strict: bool = False) -> Optional[str]:
     # Success-with-no-output and failure both collapse to None here; use
-    # _git_raw when they must be told apart.
-    return _git_raw(args, cwd) or None
+    # _git_raw when they must be told apart. strict: see _git_raw.
+    return _git_raw(args, cwd, strict=strict) or None
 
 
 # Generated artifacts of THIS versioning system. They are tracked (a committed

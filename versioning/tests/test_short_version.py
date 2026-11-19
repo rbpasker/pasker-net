@@ -8,9 +8,11 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from versioning import (canonical_version, canonical_version_client,
+from versioning import (GitError, canonical_version, canonical_version_client,
                         short_from_canonical, short_version)
 from versioning.__main__ import canonical_version as cli_canonical_version
+from versioning.__main__ import GitError as CliGitError
+from versioning.__main__ import main as cli_main
 from versioning.__main__ import next_version
 from versioning.__main__ import short_version as cli_short_version
 from versioning.tests.test_canonical_version_format import PROJECT_ROOT, _git, _TempRepo
@@ -206,6 +208,88 @@ class GitFailureIsNotClean(unittest.TestCase):
         with _TempRepo("2.0") as repo:
             self.assertEqual(short_version("2.0", repo_root=repo), "2.0-1")
             self.assertEqual(cli_short_version(repo), "2.0-1")
+
+
+class TagLookupTimeout(unittest.TestCase):
+    """A stalled `git tag` must retry, then fail loudly — never read as NOVERSION."""
+
+    @staticmethod
+    def _timeouts(sub: str, times: int):
+        """subprocess.run that times out on `sub` the first `times` calls."""
+        real = subprocess.run
+        state = {"n": 0}
+
+        def run(cmd, *a, **kw):
+            if sub in cmd and state["n"] < times:
+                state["n"] += 1
+                raise subprocess.TimeoutExpired(cmd, 5.0)
+            return real(cmd, *a, **kw)
+        return mock.patch("subprocess.run", side_effect=run), state
+
+    def setUp(self) -> None:
+        p = mock.patch("time.sleep")  # keep the retry backoff out of test time
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_transient_stall_is_retried(self) -> None:
+        with _TempRepo("2.0") as repo:
+            patch, state = self._timeouts("tag", 2)
+            with patch:
+                self.assertEqual(short_version(repo_root=repo), "2.0-1")
+            self.assertEqual(state["n"], 2)  # failed twice, third attempt answered
+
+    def test_persistent_stall_raises_not_noversion(self) -> None:
+        with _TempRepo("2.0") as repo:
+            patch, _ = self._timeouts("tag", 99)
+            with patch:
+                with self.assertRaises(GitError):
+                    short_version(repo_root=repo)
+                with self.assertRaises(GitError):
+                    canonical_version(repo_root=repo)
+                with self.assertRaises(GitError):
+                    canonical_version_client(repo_root=repo)
+
+    def test_persistent_stall_in_ahead_check_raises(self) -> None:
+        with _TempRepo("2.0") as repo:
+            patch, _ = self._timeouts("rev-list", 99)
+            with patch, self.assertRaises(GitError):
+                short_version(repo_root=repo)
+
+    def test_explicit_app_version_needs_no_tag_lookup(self) -> None:
+        with _TempRepo("2.0") as repo:
+            patch, _ = self._timeouts("tag", 99)
+            with patch:
+                self.assertEqual(short_version("2.0", repo_root=repo), "2.0-1")
+
+    def test_cli_retries_then_exits_2_with_no_stdout(self) -> None:
+        import contextlib, io
+        with _TempRepo("2.0") as repo:
+            patch, state = self._timeouts("tag", 99)
+            out, err = io.StringIO(), io.StringIO()
+            with patch, mock.patch("sys.argv", ["versioning", "--short", "--repo-root", repo]), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cli_main()
+            self.assertEqual((rc, out.getvalue()), (2, ""))
+            self.assertIn("refusing", err.getvalue())
+            self.assertEqual(state["n"], 3)
+
+    def test_cli_transient_stall_recovers(self) -> None:
+        import contextlib, io
+        with _TempRepo("2.0") as repo:
+            patch, _ = self._timeouts("tag", 1)
+            out = io.StringIO()
+            with patch, mock.patch("sys.argv", ["versioning", "--short", "--repo-root", repo]), \
+                    contextlib.redirect_stdout(out):
+                rc = cli_main()
+            self.assertEqual((rc, out.getvalue().strip()), (0, "2.0-1"))
+
+    def test_genuinely_no_tags_is_still_noversion(self) -> None:
+        with _TempRepo() as repo:
+            self.assertEqual(short_version(repo_root=repo), "NOVERSION-1")
+
+    def test_not_a_repo_keeps_unknown_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(short_version(repo_root=d), "NOVERSION-unknown")
 
 
 if __name__ == "__main__":

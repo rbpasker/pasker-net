@@ -48,6 +48,10 @@ Options:
     --increment-minor  print the next minor version (minor+1) from the latest
                        tag, e.g. 2.3 -> 2.4. For the release script.
 
+Exit status: 0 ok; 1 not a git repo (--build-number); 2 git timed out on the tag
+lookup even after retries — it prints an error to stderr and NOTHING to stdout,
+so a caller (`release.sh`, a build script) fails instead of getting `NOVERSION`.
+
 `--increment-*` emit a bare, directly-taggable string for the release script
 (no commit/branch/dirty/OS): `3.0`, or `<component>-3.0` with --component. With
 no matching tag they bootstrap from 0.0, so a first major bump is 1.0 (or
@@ -59,6 +63,7 @@ import argparse
 import re
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 # ---------------------------------------------------------------------------
@@ -69,7 +74,13 @@ from typing import List, Optional
 # command emits a pure version, not a runtime stamp.)
 # ---------------------------------------------------------------------------
 _DEFAULT_MAIN_BRANCHES = ("main", "master")
-_GIT_TIMEOUT_S = 2.0
+_GIT_TIMEOUT_S = 5.0
+_GIT_ATTEMPTS = 3  # timeouts are retried; then a strict lookup raises GitError
+
+
+class GitError(RuntimeError):
+    """git timed out on every retry for a lookup whose "nothing" result would
+    be indistinguishable from a real answer (tag lookup -> NOVERSION)."""
 NO_VERSION = "NOVERSION"
 CANONICAL_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)$")
 # Parses any version tag into (component, version); component is None for bare.
@@ -92,22 +103,31 @@ def _version_tag_re(component: Optional[str]):
     return re.compile(r"^" + re.escape(component) + r"-(\d+(?:\.\d+)+)$")
 
 
-def _git_raw(args: List[str], cwd: Optional[str]) -> Optional[str]:
+def _git_raw(args: List[str], cwd: Optional[str], strict: bool = False) -> Optional[str]:
+    # stdout (possibly "") on success, None on failure. Timeouts are retried;
+    # strict=True raises GitError if every attempt timed out.
     cmd = ["git"]
     if cwd is not None:
         cmd += ["-C", cwd]
     cmd += args
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=_GIT_TIMEOUT_S,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip()
+    for attempt in range(_GIT_ATTEMPTS):
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=_GIT_TIMEOUT_S,
+            )
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        except subprocess.TimeoutExpired:
+            if attempt + 1 < _GIT_ATTEMPTS:
+                time.sleep(0.25 * (attempt + 1))
+    if strict:
+        raise GitError(f"git {' '.join(args)} timed out after {_GIT_ATTEMPTS} attempts")
+    return None
 
 
-def _git(args: List[str], cwd: Optional[str]) -> Optional[str]:
-    return _git_raw(args, cwd) or None
+def _git(args: List[str], cwd: Optional[str], strict: bool = False) -> Optional[str]:
+    return _git_raw(args, cwd, strict) or None
 
 
 def _is_dirty(cwd: Optional[str]) -> bool:
@@ -124,7 +144,7 @@ def latest_version_tag(cwd: Optional[str], component: Optional[str] = None) -> O
     # don't match so a stray `v1.0` / `nightly` can't shadow a real release.
     # Returns the bare version (component prefix stripped) for `<component>-X.x`.
     pattern = _version_tag_re(component)
-    out = _git(["tag", "--sort=-version:refname"], cwd)
+    out = _git(["tag", "--sort=-version:refname"], cwd, strict=True)
     if not out:
         return None
     for line in out.splitlines():
@@ -146,7 +166,7 @@ def _resolve_app_version(cwd: Optional[str], component: Optional[str]) -> str:
     if tag is None:
         return NO_VERSION
     ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
-    since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd)
+    since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd, strict=True)
     if since is not None and since.isdigit() and int(since) > 0:
         return _next_minor(tag)
     return tag
@@ -192,7 +212,7 @@ def short_version(cwd: Optional[str], component: Optional[str] = None) -> str:
 def latest_versions(cwd: Optional[str]):
     # Highest released version per component (None key = bare lineage). Sorted
     # by version, so the first tag seen for a component is its highest.
-    out = _git(["tag", "--sort=-version:refname"], cwd)
+    out = _git(["tag", "--sort=-version:refname"], cwd, strict=True)
     result = {}
     if not out:
         return result
@@ -244,6 +264,14 @@ def _describe(cwd: Optional[str], component: Optional[str], stream) -> None:
 
 
 def main() -> int:
+    try:
+        return _main()
+    except GitError as e:
+        print(f"error: {e}; refusing to report a version", file=sys.stderr)
+        return 2
+
+
+def _main() -> int:
     ap = argparse.ArgumentParser(
         prog="versioning",
         description="Print the git-derived canonical version "

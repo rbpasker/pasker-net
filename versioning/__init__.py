@@ -28,6 +28,10 @@ a version received from elsewhere (a health check reading ``/api/version``).
 (``"2.0-767"``; trailing ``+`` = dirty); :func:`short_from_canonical`
 derives it from a canonical string, as the reference for ports to test against.
 
+A git call that times out is retried; if the tag lookup still can't be answered
+it raises :class:`GitError` (the CLI exits 2 with a message) instead of
+reporting ``NOVERSION``.
+
 When ``app_version`` is omitted, the base is taken from the repo's latest
 version tag (``latest_version_tag``), so releases are cut with ``git tag``
 (see ``release.sh`` / CLAUDE.md); a repo with no canonical-format tag yields
@@ -46,6 +50,7 @@ See versioning.py for the implementation.
 """
 from .versioning import (
     CANONICAL_VERSION_RE,
+    GitError,
     NO_VERSION,
     VersionParts,
     build_number,
@@ -61,6 +66,7 @@ from .versioning import (
 
 __all__ = [
     "CANONICAL_VERSION_RE",
+    "GitError",
     "NO_VERSION",
     "VersionParts",
     "build_number",
