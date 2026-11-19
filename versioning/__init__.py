@@ -24,6 +24,9 @@ Two forms share one format definition (:func:`_build`), so they can't drift:
 STRING back into a :class:`VersionParts` (``._asdict()`` for a plain dict), for
 a version received from elsewhere (a health check reading ``/api/version``).
 
+:func:`short_version` is the compact display form ``M.m-seq[+]``
+(``"2.0-767"``; trailing ``+`` = dirty).
+
 When ``app_version`` is omitted, the base is taken from the repo's latest
 version tag (``latest_version_tag``), so releases are cut with ``git tag``
 (see ``release.sh`` / CLAUDE.md); a repo with no canonical-format tag yields
@@ -51,6 +54,7 @@ from .versioning import (
     latest_version_tag,
     latest_versions,
     parse_canonical_version,
+    short_version,
 )
 
 __all__ = [
@@ -64,4 +68,5 @@ __all__ = [
     "latest_version_tag",
     "latest_versions",
     "parse_canonical_version",
+    "short_version",
 ]

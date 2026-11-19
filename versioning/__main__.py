@@ -39,6 +39,8 @@ Options:
     --list             list every component's latest version and the commit
                        it was cut at: `<component>  <X.x>  <sha>`, one per line
                        (the bare lineage shows as `(bare)`)
+    --short            instead print the short form `M.m-seq[+]` (e.g.
+                       `2.0-767`; `+` = dirty)
     --build-number     instead print `git rev-list --count HEAD` (the
                        monotonic integer for Apple CFBundleVersion)
     --increment-major  print the next major version (major+1, minor=0) from
@@ -133,7 +135,10 @@ def canonical_version(cwd: Optional[str], component: Optional[str] = None) -> st
         return f"{app_version}-unknown"
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
     dirty = _is_dirty(cwd)
+    rev = build_number(cwd)
     parts = [app_version]
+    if rev is not None:
+        parts.append(str(rev))
     if branch and branch != "HEAD" and branch not in _DEFAULT_MAIN_BRANCHES:
         parts.append(branch)
     parts.append(commit)
@@ -150,6 +155,14 @@ def build_number(cwd: Optional[str]) -> Optional[int]:
         return int(count)
     except ValueError:
         return None
+
+
+def short_version(cwd: Optional[str], component: Optional[str] = None) -> str:
+    mm = ".".join((latest_version_tag(cwd, component) or NO_VERSION).split(".")[:2])
+    seq = build_number(cwd)
+    if seq is None:
+        return f"{mm}-unknown"
+    return f"{mm}-{seq}" + ("+" if _is_dirty(cwd) else "")
 
 
 def latest_versions(cwd: Optional[str]):
@@ -225,6 +238,8 @@ def main() -> int:
     mode.add_argument("--list", action="store_true",
                       help="List every component's latest version (one per line); "
                            "the bare lineage shows as '(bare)'.")
+    mode.add_argument("--short", action="store_true",
+                      help="Print the short form M.m-seq[+] (+ = dirty).")
     mode.add_argument("--build-number", action="store_true",
                       help="Instead print `git rev-list --count HEAD` "
                            "(the monotonic integer for Apple CFBundleVersion).")
@@ -260,6 +275,10 @@ def main() -> int:
         for comp in labels:
             label = comp if comp is not None else "(bare)"
             print(f"{label:<{name_w}}  {versions[comp]:<{ver_w}}  {_sha(comp, versions[comp])}")
+        return 0
+
+    if args.short:
+        print(short_version(cwd, component))
         return 0
 
     if args.build_number:

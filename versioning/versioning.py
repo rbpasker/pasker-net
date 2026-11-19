@@ -260,6 +260,30 @@ def canonical_version_client(
     ))
 
 
+@functools.lru_cache(maxsize=None)
+def short_version(
+    app_version: Optional[str] = None,
+    repo_root: Optional[Union[str, Path]] = None,
+    *,
+    component: Optional[str] = None,
+) -> str:
+    """The SHORT display form: ``M.m-seq[+]`` — e.g. ``2.0-767`` clean,
+    ``2.0-767+`` dirty. ``M.m`` is the app version cut to major.minor,
+    ``seq`` is :func:`build_number` (the commit count), and a trailing ``+``
+    marks uncommitted changes (same dirty rule as :func:`canonical_version`).
+    No branch, hash, or OS. ``app_version`` / ``component`` behave as in
+    :func:`canonical_version`. Falls back to ``<M.m>-unknown`` when git is
+    unavailable. Cached by args; ``cache_clear()`` forces a re-read."""
+    cwd = str(repo_root) if repo_root is not None else None
+    if app_version is None:
+        app_version = latest_version_tag(repo_root, component) or NO_VERSION
+    mm = ".".join(app_version.split(".")[:2])
+    seq = build_number(cwd)
+    if seq is None:
+        return f"{mm}-unknown"
+    return f"{mm}-{seq}" + ("+" if _is_dirty(cwd) else "")
+
+
 def build_number(repo_root: Optional[Union[str, Path]] = None) -> Optional[int]:
     """Return the total commit count on HEAD (``git rev-list --count HEAD``).
 
