@@ -4,7 +4,9 @@ Format: ``<app_version>[-<branch>]-<commit>[-dirty][ (<os_version>)]``
 
 - ``app_version`` defaults to the repo's latest version tag
   (:func:`latest_version_tag`) when not passed explicitly, so the version
-  lifecycle is driven by ``git tag``. It falls back to ``"NOVERSION"`` when
+  lifecycle is driven by ``git tag``. Once HEAD is ahead of that tag it becomes
+  the NEXT MINOR (tag ``0.8`` -> ``0.9-<rev>`` on later commits) until the next
+  release is tagged; see :func:`_resolve_app_version`. It falls back to ``"NOVERSION"`` when
   the repo has no tags, or when the latest tag isn't in canonical version
   format (``CANONICAL_VERSION_RE`` — the ``X.x`` marketing form, e.g.
   ``2.0`` / ``1.3.4``).
@@ -173,6 +175,36 @@ def parse_canonical_version(version: str) -> VersionParts:
     )
 
 
+def _next_minor(version: str) -> str:
+    """``0.8`` -> ``0.9``; ``1.3.4`` -> ``1.4`` (extras dropped). Matches
+    ``next_version(..., "minor")`` in ``__main__`` — the number ``release.sh``
+    will tag next."""
+    major, minor = (int(n) for n in version.split(".")[:2])
+    return f"{major}.{minor + 1}"
+
+
+def _resolve_app_version(
+    repo_root: Optional[Union[str, Path]], component: Optional[str],
+) -> str:
+    """Base version when the caller didn't pass one: the latest tag — but once
+    HEAD is AHEAD of that tag (any commit after it), the NEXT MINOR, since a
+    tagged release is frozen and further commits are development toward the
+    next one: tag ``0.8`` at commit 63 builds as ``0.8-63``, the next commit as
+    ``0.9-64``, until ``release.sh`` tags ``0.9``. At the tagged commit itself
+    (clean or dirty) the tag version is kept. Major bumps stay a deliberate
+    ``release.sh <c> major`` — development always previews the next minor.
+    No canonical tag -> :data:`NO_VERSION`."""
+    tag = latest_version_tag(repo_root, component)
+    if tag is None:
+        return NO_VERSION
+    cwd = str(repo_root) if repo_root is not None else None
+    ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
+    since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd)
+    if since is not None and since.isdigit() and int(since) > 0:
+        return _next_minor(tag)
+    return tag
+
+
 def _gather(
     app_version: Optional[str], repo_root: Optional[Union[str, Path]],
     main_branches: tuple[str, ...], os_version: Optional[str],
@@ -186,7 +218,7 @@ def _gather(
     keeps it on any non-trunk branch; the CLIENT form only when dirty."""
     cwd = str(repo_root) if repo_root is not None else None
     if app_version is None:
-        app_version = latest_version_tag(repo_root, component) or NO_VERSION
+        app_version = _resolve_app_version(repo_root, component)
     commit = _git(["rev-parse", "--short", "HEAD"], cwd) if with_commit else None
     if with_commit and commit is None:  # git unavailable / not a repo
         return VersionParts(app_version=app_version, commit="unknown", os_version=os_version)
@@ -306,7 +338,7 @@ def short_version(
     unavailable. Cached by args; ``cache_clear()`` forces a re-read."""
     cwd = str(repo_root) if repo_root is not None else None
     if app_version is None:
-        app_version = latest_version_tag(repo_root, component) or NO_VERSION
+        app_version = _resolve_app_version(repo_root, component)
     seq = build_number(cwd)
     return _short(app_version, seq, seq is not None and _is_dirty(cwd))
 

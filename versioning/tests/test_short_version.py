@@ -10,6 +10,7 @@ from pathlib import Path
 from versioning import (canonical_version, canonical_version_client,
                         short_from_canonical, short_version)
 from versioning.__main__ import canonical_version as cli_canonical_version
+from versioning.__main__ import next_version
 from versioning.__main__ import short_version as cli_short_version
 from versioning.tests.test_canonical_version_format import PROJECT_ROOT, _git, _TempRepo
 
@@ -107,6 +108,71 @@ class ShortFromCanonical(unittest.TestCase):
                     short_from_canonical(canonical_version(repo_root=repo)), want)
                 self.assertEqual(
                     short_from_canonical(canonical_version_client(repo_root=repo)), want)
+
+
+def _commit(repo: str, text: str = "x") -> None:
+    (Path(repo) / "a").write_text(text + "\n")
+    _git(repo, "commit", "-qam", text)
+
+
+class DevelopmentPreviewsNextMinor(unittest.TestCase):
+    """After a release tag, new commits build as the NEXT minor until it's tagged."""
+
+    def test_at_tag_is_tag_version(self) -> None:
+        with _TempRepo("0.8") as repo:
+            self.assertEqual(short_version(repo_root=repo), "0.8-1")
+
+    def test_commit_after_tag_previews_next_minor(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _commit(repo, "b")
+            self.assertEqual(short_version(repo_root=repo), "0.9-2")
+            _commit(repo, "c")
+            short_version.cache_clear()  # cached per (args): same repo path
+            self.assertEqual(short_version(repo_root=repo), "0.9-3")
+
+    def test_dirty_at_tag_keeps_tag_version(self) -> None:
+        with _TempRepo("0.8") as repo:
+            (Path(repo) / "a").write_text("wip\n")
+            self.assertEqual(short_version(repo_root=repo), "0.8-1+")
+
+    def test_dirty_after_tag(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _commit(repo, "b")
+            (Path(repo) / "a").write_text("wip\n")
+            self.assertEqual(short_version(repo_root=repo), "0.9-2+")
+
+    def test_all_forms_agree(self) -> None:
+        with _TempRepo("0.8.3") as repo:
+            _commit(repo, "b")
+            self.assertTrue(canonical_version(repo_root=repo).startswith("0.9-2-"))
+            self.assertEqual(canonical_version_client(repo_root=repo), "0.9-2")
+            self.assertEqual(cli_canonical_version(repo), canonical_version(repo_root=repo))
+            self.assertEqual(cli_short_version(repo), "0.9-2")
+            self.assertEqual(
+                short_from_canonical(canonical_version(repo_root=repo)),
+                short_version(repo_root=repo))
+
+    def test_component_lineage(self) -> None:
+        with _TempRepo("srv-2.3", "cli-1.0") as repo:
+            _commit(repo, "b")
+            self.assertEqual(short_version(repo_root=repo, component="srv"), "2.4-2")
+            self.assertEqual(short_version(repo_root=repo, component="cli"), "1.1-2")
+
+    def test_explicit_app_version_untouched(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _commit(repo, "b")
+            self.assertEqual(short_version("0.8", repo_root=repo), "0.8-2")
+
+    def test_no_tag_stays_noversion(self) -> None:
+        with _TempRepo() as repo:
+            _commit(repo, "b")
+            self.assertEqual(short_version(repo_root=repo), "NOVERSION-2")
+
+    def test_preview_equals_what_release_will_tag(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _commit(repo, "b")
+            self.assertEqual(short_version(repo_root=repo).split("-")[0],
+                             next_version(repo, "minor"))
 
 
 if __name__ == "__main__":

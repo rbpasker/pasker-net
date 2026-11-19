@@ -128,8 +128,26 @@ def latest_version_tag(cwd: Optional[str], component: Optional[str] = None) -> O
     return None
 
 
+def _next_minor(version: str) -> str:
+    major, minor = (int(n) for n in version.split(".")[:2])
+    return f"{major}.{minor + 1}"
+
+
+def _resolve_app_version(cwd: Optional[str], component: Optional[str]) -> str:
+    # Latest tag, or the NEXT MINOR once HEAD is ahead of it (development toward
+    # the next release). Mirrors versioning.py's _resolve_app_version.
+    tag = latest_version_tag(cwd, component)
+    if tag is None:
+        return NO_VERSION
+    ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
+    since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd)
+    if since is not None and since.isdigit() and int(since) > 0:
+        return _next_minor(tag)
+    return tag
+
+
 def canonical_version(cwd: Optional[str], component: Optional[str] = None) -> str:
-    app_version = latest_version_tag(cwd, component) or NO_VERSION
+    app_version = _resolve_app_version(cwd, component)
     commit = _git(["rev-parse", "--short", "HEAD"], cwd)
     if commit is None:
         return f"{app_version}-unknown"
@@ -158,7 +176,7 @@ def build_number(cwd: Optional[str]) -> Optional[int]:
 
 
 def short_version(cwd: Optional[str], component: Optional[str] = None) -> str:
-    mm = ".".join((latest_version_tag(cwd, component) or NO_VERSION).split(".")[:2])
+    mm = ".".join(_resolve_app_version(cwd, component).split(".")[:2])
     seq = build_number(cwd)
     if seq is None:
         return f"{mm}-unknown"
