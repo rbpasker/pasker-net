@@ -400,8 +400,8 @@ def _main() -> int:
                          "commit, dirty) to stderr; stdout stays the bare result.")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--list", action="store_true",
-                      help="List every component's latest version (one per line); "
-                           "the bare lineage shows as '(bare)'.")
+                      help="List every component's latest version, pre-releases included "
+                           "(one per line); the bare lineage shows as '(bare)'.")
     mode.add_argument("--short", action="store_true",
                       help="Print the short form M.m-seq[+] (+ = dirty).")
     mode.add_argument("--build-number", action="store_true",
