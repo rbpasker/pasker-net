@@ -19,6 +19,9 @@ The emitted file declares an ``enum`` (Swift's idiomatic namespace) with:
   * ``build`` — ``<app>-<revNumber>`` clean; a dirty build appends
     ``[-<branch>]-dirty (<buildTime>)`` (a Zulu-time stamp). Mirrors the Python
     ``canonical_version_client`` (rev, no commit hash).
+  * ``programSuffix`` / ``tagAppVersion`` — the pre-release stage (``b3``) and
+    tag-derived version, baked from the git tags (Apple's plist version can't hold
+    a stage); ``build`` appends the suffix: ``0.9b3-70``
   * ``full`` — ``<build> (<os>)``
 
 Note: ``#if os(iOS)`` is true on iPad as well — Swift has no
@@ -49,7 +52,9 @@ from pathlib import Path
 
 # Allow running as a script without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from versioning.versioning import _git, _is_dirty, build_number  # noqa: E402
+from versioning.versioning import (  # noqa: E402
+    _git, _is_dirty, _resolve_app_version, build_number, split_program_version,
+)
 
 
 _TEMPLATE = '''\
@@ -71,6 +76,17 @@ enum {type_name} {{
     /// recoverable from its commit; a dirty build has no commit to point at.
     static let buildTime = "{build_time}"
 
+    /// Pre-release stage of this build, from the git tags: "" for a release or
+    /// development build, "a1" / "b3" / "rc2" for an alpha / beta / rc. Apple
+    /// requires CFBundleShortVersionString to be digits and dots only, so the
+    /// stage cannot live in the plist — it is baked here and appended in `build`.
+    static let programSuffix = "{program_suffix}"
+
+    /// The app version the git tags imply for this build ("0.9b3", "0.10", "0.8").
+    /// Compare its release part with `appVersion` to catch a plist whose
+    /// MARKETING_VERSION has drifted from the tags (`appVersionMatchesTags`).
+    static let tagAppVersion = "{tag_app_version}"
+
     /// Trunk branch names whose name is omitted from `build`.
     static let mainBranches: Set<String> = [{main_branches}]
 
@@ -80,11 +96,21 @@ enum {type_name} {{
         (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
     }}
 
-    /// Clean: "<X.x>-<revNumber>" — matches Apple's "X.x (revNumber)".
+    /// True when the plist's marketing version equals the release part of the
+    /// tag-derived version (`0.9` for `0.9b3`), ignoring a patch component.
+    static var appVersionMatchesTags: Bool {{
+        let tag = tagAppVersion.split(whereSeparator: {{ !"0123456789.".contains($0) }}).first.map(String.init) ?? tagAppVersion
+        let a = appVersion.split(separator: ".").prefix(2).joined(separator: ".")
+        let t = tag.split(separator: ".").prefix(2).joined(separator: ".")
+        return a == t
+    }}
+
+    /// Clean: "<X.x><stage>-<revNumber>" — Apple's "X.x (revNumber)" with the
+    /// pre-release stage (if any) after the version, e.g. "0.9b3-70".
     /// Dirty: appends "-[<branch>-]dirty (<buildTime>)" (branch omitted on a
     /// trunk branch / detached HEAD).
     static var build: String {{
-        var s = "\\(appVersion)-\\(revNumber)"
+        var s = "\\(appVersion)\\(programSuffix)-\\(revNumber)"
         if gitDirty {{
             if !gitBranch.isEmpty, gitBranch != "HEAD", !mainBranches.contains(gitBranch) {{
                 s += "-\\(gitBranch)"
@@ -134,8 +160,13 @@ def emit(
     repo_root: str | None,
     type_name: str,
     main_branches: tuple[str, ...],
+    component: str | None = None,
 ) -> str:
     cwd = repo_root or None
+    # Raises GitError if the tag lookup times out (fails the build loudly, not NOVERSION).
+    tag_version = _resolve_app_version(cwd, component)
+    _, stage, number = split_program_version(tag_version)
+    program_suffix = f"{stage}{number}" if stage else ""
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd) or ""
     commit = _git(["rev-parse", "--short", "HEAD"], cwd) or "unknown"
     dirty = _is_dirty(cwd)
@@ -151,6 +182,8 @@ def emit(
         git_dirty="true" if dirty else "false",
         rev_number=rev,
         build_time=_swift_escape(build_time),
+        program_suffix=program_suffix,
+        tag_app_version=_swift_escape(tag_version),
         main_branches=", ".join(f'"{_swift_escape(b)}"' for b in main_branches),
     )
 
@@ -163,6 +196,9 @@ def main() -> int:
                     help="Destination Swift file.")
     ap.add_argument("--type-name", default="CanonicalVersion",
                     help='Name of the emitted Swift enum (default: "CanonicalVersion")')
+    ap.add_argument("--component", default=None, metavar="NAME",
+                    help="Scope the tag lineage to `<NAME>-<X.x>` tags (the pre-release "
+                         "stage and tag-derived version come from them).")
     ap.add_argument("--main-branch", action="append", default=None,
                     metavar="NAME",
                     help='Branch name to treat as trunk (omit infix). '
@@ -170,7 +206,7 @@ def main() -> int:
     args = ap.parse_args()
 
     main_branches = tuple(args.main_branch) if args.main_branch else ("main", "master")
-    body = emit(args.repo_root, args.type_name, main_branches)
+    body = emit(args.repo_root, args.type_name, main_branches, args.component)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # Only write if changed, to avoid invalidating Xcode's incremental build.

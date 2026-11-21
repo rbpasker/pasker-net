@@ -37,9 +37,22 @@ qworkers). PRs welcome. --Bob at y0u kn0w wh3r3
     (e.g. `server-2.1`), giving each component its own lineage so siblings
     can't shadow each other. Increments then emit the prefixed tag
     (`server-3.0`); the canonical string stays version-only (`2.1-<commit>`).
+  - `short_version()` → `M.m-seq[+]` (e.g. `0.9b3-70+`; `+` = dirty), and
+    `short_from_canonical(str)` derives it from either canonical form — the
+    reference every port is tested against. `python3 -m versioning --short`.
+  - **Programs (alpha/beta/rc).** Tags `<X.x>a<N>` / `b<N>` / `rc<N>` (`0.9a1`,
+    `0.9b2`, `0.9rc1`) sort below the release `0.9`. Builds ahead of the newest
+    *reachable* tag preview the next step in the same program (`0.9b2` →
+    `0.9b3`; release `0.8` → `0.9`), so development never claims a released
+    number. Advance with `release.sh <component> alpha|beta|rc|release` (or
+    `--increment PROGRAM`), which refuses illegal moves (exit 3). A git
+    timeout is retried, then fails loudly (exit 2) rather than reporting
+    `NOVERSION`. `latest_version_tag()` stays release-only;
+    `latest_program_tag()` / `latest_programs()` include pre-releases.
   Ships `emit_swift.py` to generate a `CanonicalVersion` Swift enum from an
-  Xcode Run Script Phase. The Swift `build` getter renders `X.x-<n>` (marketing
-  `X.x` + rev count `n`), so the in-app stamp matches Apple's `X.x (n)`; a dirty
+  Xcode Run Script Phase. The Swift `build` getter renders `X.x[<stage>]-<n>`
+  (marketing `X.x` from the plist + the baked pre-release `programSuffix` +
+  rev count `n`), so the in-app stamp matches Apple's `X.x (n)`; a dirty
   tree appends `-[<branch>-]dirty(<buildtime>)`. Stdlib only.
 - [`queuing/`](queuing/) — in-memory named FIFO queues backed by a
   projection of the consumer's durable state. The library holds no SQL

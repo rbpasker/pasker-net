@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 
 from versioning import (
-    VersionParts, canonical_version, canonical_version_client, latest_program_tag,
-    latest_version_tag, parse_canonical_version, short_from_canonical,
+    GitError, VersionParts, canonical_version, canonical_version_client, latest_program_tag,
+    latest_programs, latest_version_tag, latest_versions, parse_canonical_version, short_from_canonical,
     short_version, split_program_version,
 )
 from versioning.__main__ import canonical_version as cli_canonical_version
@@ -224,6 +224,297 @@ class NextProgramVersion(unittest.TestCase):
             self.assertEqual(latest_program_tag(repo), "0.9")
 
 
+class ReachableTagsOnly(unittest.TestCase):
+    """A build's version comes from tags REACHABLE from HEAD, not every tag in the repo."""
+
+    def test_checkout_older_than_the_tag(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _commit(repo, "older")
+            older = _git(repo, "rev-parse", "HEAD")
+            _commit(repo, "newer")
+            _git(repo, "tag", "-a", "0.9", "-m", "x")
+            _git(repo, "checkout", "-q", older)
+            f = _forms(repo)
+            self.assertEqual(f["short"], "0.9-2")  # ahead of 0.8 -> next-minor preview
+            self.assertEqual(f["short"], f["cli_short"])
+            self.assertEqual(latest_program_tag(repo, merged=True), "0.8")
+            self.assertEqual(latest_program_tag(repo), "0.9")  # all tags still seen
+
+    def test_older_than_every_tag_has_no_version(self) -> None:
+        with _TempRepo() as repo:
+            first = _git(repo, "rev-parse", "HEAD")
+            _commit(repo, "later")
+            _git(repo, "tag", "-a", "1.0", "-m", "x")
+            _git(repo, "checkout", "-q", first)
+            self.assertEqual(_forms(repo)["short"], "NOVERSION-1")
+
+    def test_tag_on_unmerged_branch_is_ignored(self) -> None:
+        with _TempRepo("0.8") as repo:
+            main = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+            _git(repo, "checkout", "-q", "-b", "rel")
+            _commit(repo, "rel")
+            _git(repo, "tag", "-a", "1.0", "-m", "x")
+            _git(repo, "checkout", "-q", main)
+            _commit(repo, "m")
+            f = _forms(repo)
+            self.assertEqual(f["short"], "0.9-2")  # not 1.1
+            self.assertEqual(f["short"], f["cli_short"])
+
+    def test_next_tag_uses_all_tags_so_numbers_are_never_reissued(self) -> None:
+        with _TempRepo("0.8") as repo:
+            main = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+            _git(repo, "checkout", "-q", "-b", "rel")
+            _commit(repo, "rel")
+            _git(repo, "tag", "-a", "0.9a1", "-m", "x")
+            _git(repo, "checkout", "-q", main)
+            _commit(repo, "m")
+            self.assertEqual(next_program_version(repo, "alpha"), "0.9a2")
+
+    def test_merged_tag_counts(self) -> None:
+        with _TempRepo("0.8") as repo:
+            main = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+            _git(repo, "checkout", "-q", "-b", "rel")
+            _commit(repo, "rel")
+            _git(repo, "tag", "-a", "0.9b1", "-m", "x")
+            _git(repo, "checkout", "-q", main)
+            _git(repo, "merge", "-q", "--no-ff", "-m", "merge", "rel")
+            self.assertTrue(_forms(repo)["short"].startswith("0.9b2-"))
+
+
+class ListAndDescribe(unittest.TestCase):
+    def _run(self, repo, *flags):
+        return subprocess.run([sys.executable, "-m", "versioning", "--repo-root", repo, *flags],
+                              capture_output=True, text=True, cwd=str(PROJECT_ROOT))
+
+    def test_list_shows_prerelease_like_builds_do(self) -> None:
+        with _TempRepo("queuing-1.0", "queuing-1.1b1", "versioning-2.0", "0.5a1") as repo:
+            rows = {ln.split()[0]: ln.split()[1]
+                    for ln in self._run(repo, "--list").stdout.splitlines()}
+            self.assertEqual(rows, {"queuing": "1.1b1", "versioning": "2.0", "(bare)": "0.5a1"})
+            self.assertEqual(latest_programs(repo),
+                             {"queuing": "1.1b1", "versioning": "2.0", None: "0.5a1"})
+
+    def test_list_matches_what_a_build_reports(self) -> None:
+        with _TempRepo("queuing-1.1b1") as repo:
+            listed = self._run(repo, "--list").stdout.split()[1]
+            self.assertEqual(_forms(repo, component="queuing")["short"].split("-")[0], listed)
+
+    def test_release_only_lookups_unchanged(self) -> None:
+        with _TempRepo("queuing-1.0", "queuing-1.1b1") as repo:
+            self.assertEqual(latest_versions(repo), {"queuing": "1.0"})
+
+    def test_describe_reports_the_reachable_program_tag(self) -> None:
+        with _TempRepo("0.9b2") as repo:
+            self.assertIn("0.9b2", self._run(repo, "-v", "--short").stderr)
+
+
+class LibraryAndCliCopyAgree(unittest.TestCase):
+    """The CLI inlines its own copy of the library; compare them over many repo states."""
+
+    SCENARIOS = [
+        (), ("0.8",), ("0.9a1",), ("0.9b2",), ("1.3.4rc1",), ("0.8", "0.9a3", "0.9b1"),
+        ("0.9a1", "0.9b1", "0.9"), ("srv-2.3b1", "srv-2.2", "cli-1.0", "0.5a1"),
+        ("v1.0", "2.0-rc1", "nightly"),
+    ]
+
+    def test_constants_match(self) -> None:
+        import versioning.__main__ as cli
+        import versioning.versioning as lib
+        for name in ("_DEFAULT_MAIN_BRANCHES", "_GIT_TIMEOUT_S", "_GIT_ATTEMPTS", "NO_VERSION",
+                     "PRE_STAGES", "_GENERATED_EXCLUDES", "_KINDS"):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(cli, name), getattr(lib, name))
+        for name in ("CANONICAL_VERSION_RE", "PROGRAM_VERSION_RE", "_ANY_VERSION_TAG_RE",
+                     "_ANY_PROGRAM_TAG_RE"):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(cli, name).pattern, getattr(lib, name).pattern)
+
+    @staticmethod
+    def _either(fn, *args):
+        try:
+            return fn(*args)
+        except ValueError as e:
+            return f"ValueError: {e}"
+
+    def test_lookups_agree_over_scenarios(self) -> None:
+        import versioning.__main__ as cli
+        import versioning.versioning as lib
+        for tags in self.SCENARIOS:
+            with _TempRepo(*tags) as repo:
+                _commit(repo, "ahead")
+                for comp in (None, "srv", "cli"):
+                    with self.subTest(tags=tags, comp=comp):
+                        self.assertEqual(cli.latest_version_tag(repo, comp),
+                                         lib.latest_version_tag(repo, comp))
+                        for merged in (False, True):
+                            self.assertEqual(cli.latest_program_tag(repo, comp, merged),
+                                             lib.latest_program_tag(repo, comp, merged=merged))
+                        self.assertEqual(cli._resolve_app_version(repo, comp),
+                                         lib._resolve_app_version(repo, comp))
+                        for kind in ("alpha", "beta", "rc", "release"):
+                            self.assertEqual(
+                                self._either(cli.next_program_version, repo, kind, comp),
+                                self._either(lib.next_program_version, repo, kind, comp))
+                        for part in ("major", "minor"):
+                            self.assertEqual(self._either(cli.next_version, repo, part, comp),
+                                             self._either(lib.next_version, repo, part, comp))
+                with self.subTest(tags=tags, what="global"):
+                    self.assertEqual(cli.latest_programs(repo), lib.latest_programs(repo))
+                    self.assertEqual(cli.latest_versions(repo), lib.latest_versions(repo))
+                    self.assertEqual(cli.build_number(repo), lib.build_number(repo))
+
+    def test_pure_helpers_agree(self) -> None:
+        import versioning.__main__ as cli
+        import versioning.versioning as lib
+        for v in ("0.9", "0.9b2", "1.3.4rc1", "10.4.1", "NOVERSION", "2.0-rc1", ""):
+            with self.subTest(v=v):
+                self.assertEqual(cli.split_program_version(v), lib.split_program_version(v))
+                self.assertEqual(cli._short_app(v), lib._short_app(v))
+        order = ["0.9", "0.9a1", "0.9b1", "0.9rc1", "0.10a1", "1.0"]
+        self.assertEqual(sorted(order, key=cli._program_key), sorted(order, key=lib._program_key))
+
+
+class PartsAsDict(unittest.TestCase):
+    def test_as_dict_includes_derived_fields(self) -> None:
+        d = parse_canonical_version("0.9b3-70-9151ff8-dirty").as_dict()
+        self.assertEqual((d["app_version"], d["release_version"], d["stage"], d["pre_number"],
+                          d["rev_number"], d["dirty"]), ("0.9b3", "0.9", "b", 3, 70, True))
+
+    def test_release_as_dict(self) -> None:
+        d = parse_canonical_version("0.9-70-9151ff8").as_dict()
+        self.assertEqual((d["stage"], d["pre_number"], d["release_version"]), (None, None, "0.9"))
+
+
+class SwiftEmitter(unittest.TestCase):
+    def _emit(self, repo: str, component=None) -> str:
+        from versioning.emit_swift import emit
+        return emit(repo, "CanonicalVersion", ("main", "master"), component)
+
+    def test_prerelease_bakes_stage_and_tag_version(self) -> None:
+        with _TempRepo("0.9b2") as repo:
+            out = self._emit(repo)
+            self.assertIn('static let programSuffix = "b2"', out)
+            self.assertIn('static let tagAppVersion = "0.9b2"', out)
+            self.assertIn(r'"\(appVersion)\(programSuffix)-\(revNumber)"', out)
+
+    def test_ahead_of_prerelease_previews_next_number(self) -> None:
+        with _TempRepo("0.9b2") as repo:
+            _commit(repo, "x")
+            out = self._emit(repo)
+            self.assertIn('programSuffix = "b3"', out)
+            self.assertIn('tagAppVersion = "0.9b3"', out)
+
+    def test_release_and_development_have_empty_suffix(self) -> None:
+        with _TempRepo("0.8") as repo:
+            self.assertIn('programSuffix = ""', self._emit(repo))
+            _commit(repo, "x")
+            out = self._emit(repo)
+            self.assertIn('programSuffix = ""', out)
+            self.assertIn('tagAppVersion = "0.9"', out)
+
+    def test_component_lineage(self) -> None:
+        with _TempRepo("srv-2.3a1", "cli-1.0") as repo:
+            self.assertIn('programSuffix = "a1"', self._emit(repo, "srv"))
+            self.assertIn('programSuffix = ""', self._emit(repo, "cli"))
+
+    def test_idempotent(self) -> None:
+        with _TempRepo("0.9b2") as repo:
+            self.assertEqual(self._emit(repo), self._emit(repo))
+
+    def test_tag_lookup_stall_fails_the_emit(self) -> None:
+        from unittest import mock
+        real = subprocess.run
+
+        def run(cmd, *a, **kw):
+            if "tag" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 5.0)
+            return real(cmd, *a, **kw)
+        with _TempRepo("0.9b2") as repo, mock.patch("time.sleep"), \
+                mock.patch("subprocess.run", side_effect=run):
+            with self.assertRaises(GitError):
+                self._emit(repo)
+
+    @unittest.skipUnless(shutil.which("swiftc"), "swiftc not installed")
+    def test_generated_swift_typechecks(self) -> None:
+        with _TempRepo("0.9b2") as repo, tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "CanonicalVersion.swift"
+            f.write_text(self._emit(repo))
+            r = subprocess.run(["swiftc", "-typecheck", str(f)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class LifecycleSimulation(unittest.TestCase):
+    """Walk a throwaway repo through a whole program with empty commits and pin
+    the version at every step (the sequence we exercised by hand)."""
+
+    def _commit(self, repo: str, n: int = 1) -> None:
+        for _ in range(n):
+            _git(repo, "commit", "-q", "--allow-empty", "-m", "c")
+
+    def _tag(self, repo: str, kind: str) -> str:
+        t = next_program_version(repo, kind)
+        _git(repo, "tag", "-a", t, "-m", t)
+        return t
+
+    def test_alpha_to_release_and_beyond(self) -> None:
+        with _TempRepo("0.8") as repo:                    # init commit, tagged 0.8
+            steps = [
+                # (action, expected short, expected tag created or None)
+                (None,                 "0.8-1",     None),
+                (("commit", 1),        "0.9-2",     None),
+                (("commit", 1),        "0.9-3",     None),
+                (("tag", "alpha"),     "0.9a1-3",   "0.9a1"),   # tag on this commit
+                (("commit", 1),        "0.9a2-4",   None),
+                (("tag", "alpha"),     "0.9a2-4",   "0.9a2"),
+                (("commit", 1),        "0.9a3-5",   None),
+                (("tag", "beta"),      "0.9b1-5",   "0.9b1"),
+                (("commit", 2),        "0.9b2-7",   None),
+                (("tag", "beta"),      "0.9b2-7",   "0.9b2"),
+                (("commit", 1),        "0.9b3-8",   None),
+                (("tag", "rc"),        "0.9rc1-8",  "0.9rc1"),
+                (("commit", 1),        "0.9rc2-9",  None),
+                (("tag", "release"),   "0.9-9",     "0.9"),
+                (("commit", 1),        "0.10-10",   None),
+            ]
+            for action, want_short, want_tag in steps:
+                with self.subTest(action=action):
+                    if action:
+                        verb, arg = action
+                        if verb == "commit":
+                            self._commit(repo, arg)
+                        else:
+                            self.assertEqual(self._tag(repo, arg), want_tag)
+                    f = _forms(repo)
+                    self.assertEqual(f["short"], want_short)
+                    # Every form and the CLI copy agree, and share the same M.m + seq.
+                    self.assertEqual(f["short"], f["cli_short"])
+                    self.assertEqual(f["server"], f["cli_server"])
+                    self.assertEqual(short_from_canonical(f["server"]), f["short"])
+                    self.assertEqual(short_from_canonical(f["client"]), f["short"])
+                    self.assertEqual(f["client"], f["short"])  # clean client form == short
+
+    def test_dirty_at_a_prerelease_tag(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _git(repo, "tag", "-a", "0.9b1", "-m", "b")
+            (Path(repo) / "a").write_text("wip\n")
+            f = _forms(repo)
+            self.assertEqual(f["short"], "0.9b1-1+")
+            self.assertTrue(f["server"].endswith("-dirty"))
+            self.assertEqual(short_from_canonical(f["server"]), "0.9b1-1+")
+
+    def test_illegal_moves_leave_tags_untouched(self) -> None:
+        with _TempRepo("0.9b1") as repo:
+            before = _git(repo, "tag")
+            for kind in ("alpha",):
+                with self.assertRaises(ValueError):
+                    next_program_version(repo, kind)
+            self.assertEqual(_git(repo, "tag"), before)
+
+    def test_two_tags_on_one_commit_report_the_highest(self) -> None:
+        with _TempRepo("0.9b1", "0.9b2") as repo:
+            self.assertEqual(_forms(repo)["short"], "0.9b2-1")
+
+
 class IncrementCLI(unittest.TestCase):
     def _run(self, repo: str, *flags: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -239,7 +530,7 @@ class IncrementCLI(unittest.TestCase):
     def test_illegal_move_exits_1_with_no_stdout(self) -> None:
         with _TempRepo("0.9b1") as repo:
             r = self._run(repo, "--increment", "alpha")
-            self.assertEqual((r.returncode, r.stdout), (1, ""))
+            self.assertEqual((r.returncode, r.stdout), (3, ""))
             self.assertIn("cannot go back", r.stderr)
 
     def test_bad_program_name_is_a_usage_error(self) -> None:
@@ -251,10 +542,30 @@ class IncrementCLI(unittest.TestCase):
             self.assertEqual(
                 self._run(repo, "--increment", "beta", "--increment-minor").returncode, 2)
 
-    def test_existing_increments_unchanged_with_prereleases_present(self) -> None:
-        # --increment-minor/major stay release-based.
+    def test_minor_over_a_prerelease_is_refused(self) -> None:
+        # A minor bump would silently skip the program in flight: promote instead.
         with _TempRepo("0.8", "0.9b2") as repo:
-            self.assertEqual(self._run(repo, "--increment-minor").stdout.strip(), "0.9")
+            r = self._run(repo, "--increment-minor")
+            self.assertEqual((r.returncode, r.stdout), (3, ""))
+            self.assertIn("use `release`", r.stderr)
+            self.assertEqual(self._run(repo, "--increment", "release").stdout.strip(), "0.9")
+
+    def test_major_over_a_prerelease_is_allowed(self) -> None:
+        with _TempRepo("0.8", "0.9b2") as repo:
+            self.assertEqual(self._run(repo, "--increment-major").stdout.strip(), "1.0")
+
+    def test_minor_major_unchanged_without_prereleases(self) -> None:
+        with _TempRepo("2.3") as repo:
+            self.assertEqual(self._run(repo, "--increment-minor").stdout.strip(), "2.4")
+            self.assertEqual(self._run(repo, "--increment-major").stdout.strip(), "3.0")
+
+    def test_exit_codes_are_distinct(self) -> None:
+        with _TempRepo("0.9b1") as repo:
+            illegal = self._run(repo, "--increment", "alpha").returncode
+            usage = self._run(repo, "--increment", "gamma").returncode
+        with tempfile.TemporaryDirectory() as d:
+            notrepo = self._run(d, "--build-number").returncode
+        self.assertEqual((notrepo, usage, illegal), (1, 2, 3))
 
     def test_verbose_describes_program_tag(self) -> None:
         with _TempRepo("0.9b2") as repo:

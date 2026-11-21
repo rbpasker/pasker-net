@@ -161,6 +161,15 @@ class VersionParts(NamedTuple):
         """The pre-release number (``0.9b3`` -> 3), or None."""
         return split_program_version(self.app_version)[2]
 
+    def as_dict(self) -> dict:
+        """The stored fields (``_asdict()``) PLUS the derived ``release_version``,
+        ``stage`` and ``pre_number`` — for telemetry / JSON, where the derived
+        properties would otherwise be lost."""
+        d = dict(self._asdict())
+        d.update(release_version=self.release_version, stage=self.stage,
+                 pre_number=self.pre_number)
+        return d
+
 
 def _build(parts: VersionParts) -> str:
     """Render a :class:`VersionParts` into the canonical string — the SINGLE
@@ -273,11 +282,15 @@ def _resolve_app_version(
       as ``0.8-63``, the next commit as ``0.9-64``;
     * pre-release ``0.9b2`` -> ``0.9b3`` (next number, same stage).
 
+    Only tags REACHABLE from HEAD count (``git tag --merged HEAD``): a tag on an
+    unmerged branch, or on a commit after HEAD (an older checkout), must not
+    shape this build's version.
+
     At the tagged commit itself (clean or dirty) the tag version is kept. A
     stage never advances on its own — alpha -> beta -> rc -> release is a
     deliberate ``release.sh <component> beta|rc|release``. Major bumps stay a
     deliberate ``release.sh <c> major``. No canonical tag -> :data:`NO_VERSION`."""
-    tag = latest_program_tag(repo_root, component)
+    tag = latest_program_tag(repo_root, component, merged=True)
     if tag is None:
         return NO_VERSION
     cwd = str(repo_root) if repo_root is not None else None
@@ -493,6 +506,8 @@ def latest_version_tag(
 def latest_program_tag(
     repo_root: Optional[Union[str, Path]] = None,
     component: Optional[str] = None,
+    *,
+    merged: bool = False,
 ) -> Optional[str]:
     """Return the highest version of ANY stage — release or pre-release — or
     ``None``: ``0.9b2`` outranks ``0.9a3`` and ``0.8``, and the release ``0.9``
@@ -500,10 +515,14 @@ def latest_program_tag(
     version sort would put ``0.9`` below ``0.9b1``). Unlike
     :func:`latest_version_tag`, which stays release-only for existing callers,
     this is what the build version derives from. Same ``component`` scoping and
-    timeout behaviour (raises :class:`GitError`) as :func:`latest_version_tag`."""
+    timeout behaviour (raises :class:`GitError`) as :func:`latest_version_tag`.
+
+    ``merged=True`` considers only tags reachable from HEAD — what a BUILD's
+    version must use. The default (all tags) is what picks the NEXT tag number,
+    so a tag on another branch can't be tagged twice."""
     cwd = str(repo_root) if repo_root is not None else None
     pattern = _program_tag_re(component)
-    out = _git(["tag"], cwd, strict=True)
+    out = _git(["tag", *(["--merged", "HEAD"] if merged else [])], cwd, strict=True)
     if not out:
         return None
     found = [m.group(1) for line in out.splitlines()
@@ -538,6 +557,95 @@ def latest_versions(repo_root: Optional[Union[str, Path]] = None) -> "dict[Optio
         component, version = match.group(1), match.group(2)
         result.setdefault(component, version)  # first seen = highest
     return result
+
+
+#: Like ``_ANY_VERSION_TAG_RE`` but also matching pre-release tags.
+_ANY_PROGRAM_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)$")
+
+
+def latest_programs(repo_root: Optional[Union[str, Path]] = None) -> "dict[Optional[str], str]":
+    """Map each component to its highest version of ANY stage (release or
+    pre-release) — :func:`latest_versions` is the release-only twin. The bare
+    lineage is keyed ``None``. Empty if no version tags / git unavailable;
+    raises :class:`GitError` if git times out."""
+    cwd = str(repo_root) if repo_root is not None else None
+    out = _git(["tag"], cwd, strict=True)
+    result: "dict[Optional[str], str]" = {}
+    if not out:
+        return result
+    for line in out.splitlines():
+        m = _ANY_PROGRAM_TAG_RE.match(line.strip())
+        if not m:
+            continue
+        comp, version = m.group(1), m.group(2)
+        if comp not in result or _program_key(version) > _program_key(result[comp]):
+            result[comp] = version
+    return result
+
+
+def next_version(
+    repo_root: Optional[Union[str, Path]], part: str, component: Optional[str] = None,
+) -> str:
+    """Next RELEASE tag for ``part`` ``"major"`` / ``"minor"`` (``2.3`` -> ``3.0``
+    / ``2.4``; extras dropped), bare or ``<component>-…`` — what the release
+    script tags. Computed from the latest tag of any stage. A ``minor`` bump
+    while a pre-release is the latest tag raises ``ValueError``: promote it
+    with ``release`` (see :func:`next_program_version`) instead of skipping its
+    program. ``major`` is allowed (a deliberate jump). No tag bootstraps from
+    ``0.0``."""
+    latest = latest_program_tag(repo_root, component)
+    pre = f"{component}-" if component else ""
+    if latest is None:
+        major, minor = 0, 0
+    else:
+        base, stage, _ = split_program_version(latest)
+        if stage and part == "minor":
+            raise ValueError(
+                f"{pre}{latest} is a pre-release; use `release` to promote it "
+                f"(a minor bump would skip its program)")
+        major, minor = (int(n) for n in base.split(".")[:2])
+    return pre + (f"{major + 1}.0" if part == "major" else f"{major}.{minor + 1}")
+
+
+_KINDS = {"alpha": "a", "beta": "b", "rc": "rc"}
+
+
+def next_program_version(
+    repo_root: Optional[Union[str, Path]], kind: str, component: Optional[str] = None,
+) -> str:
+    """Next tag for advancing a program: ``kind`` is ``alpha`` / ``beta`` / ``rc``
+    / ``release``. Raises ``ValueError`` on an illegal move. From the latest tag
+    of any stage:
+
+    * release ``0.8``: alpha/beta/rc start the next minor (``0.9a1`` / ``0.9b1``
+      / ``0.9rc1``); ``release`` is refused (nothing to promote).
+    * pre-release ``0.9a2``: same kind -> ``0.9a3``; a LATER stage starts it
+      (``beta`` -> ``0.9b1``); ``release`` promotes it to ``0.9``; an EARLIER
+      stage is refused (no going backwards).
+    * no tag: bootstraps from ``0.0`` (``alpha`` -> ``0.1a1``); ``release``
+      is refused.
+
+    Returned bare (or ``<component>-…``), directly taggable. Uses ALL tags (not
+    just reachable ones) so a number is never issued twice."""
+    if kind != "release" and kind not in _KINDS:
+        raise ValueError(f"unknown program {kind!r} (alpha|beta|rc|release)")
+    latest = latest_program_tag(repo_root, component)
+    pre = f"{component}-" if component else ""
+    if latest is None:
+        if kind == "release":
+            raise ValueError("no tag to promote to a release")
+        return f"{pre}0.1{_KINDS[kind]}1"
+    base, stage, n = split_program_version(latest)
+    if stage is None:  # latest is a release
+        if kind == "release":
+            raise ValueError(f"{pre}{latest} is already a release; nothing to promote")
+        return f"{pre}{_next_minor(latest)}{_KINDS[kind]}1"
+    if kind == "release":
+        return f"{pre}{base}"
+    want = _KINDS[kind]
+    if PRE_STAGES.index(want) < PRE_STAGES.index(stage):
+        raise ValueError(f"cannot go back from {pre}{latest} to {kind}")
+    return f"{pre}{base}{want}{n + 1 if want == stage else 1}"
 
 
 def current_os() -> str:

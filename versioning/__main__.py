@@ -36,8 +36,8 @@ Options:
     -v, --verbose      print the derivation (component, base tag, branch,
                        commit, dirty) to stderr; stdout stays the bare result.
   mutually exclusive (default prints the canonical version):
-    --list             list every component's latest version and the commit
-                       it was cut at: `<component>  <X.x>  <sha>`, one per line
+    --list             list every component's latest version (any stage,
+                       pre-releases included) and the commit it was cut at: `<component>  <X.x>  <sha>`, one per line
                        (the bare lineage shows as `(bare)`)
     --short            instead print the short form `M.m-seq[+]` (e.g.
                        `2.0-767`; `+` = dirty)
@@ -46,16 +46,18 @@ Options:
     --increment PROGRAM  print the next tag for a pre-release program (alpha, beta,
                        rc, or release to promote): 0.8 -> alpha 0.9a1, 0.9a2 ->
                        beta 0.9b1, 0.9rc1 -> release 0.9. Refuses illegal moves
-                       (e.g. alpha after beta) with exit 1. Pre-release tags are
+                       (e.g. alpha after beta) with exit 3. Pre-release tags are
                        `<X.x>a<N>` / `b<N>` / `rc<N>`; they sort below release X.x.
     --increment-major  print the next major version (major+1, minor=0) from
                        the latest tag, e.g. 2.3 -> 3.0. For the release script.
     --increment-minor  print the next minor version (minor+1) from the latest
                        tag, e.g. 2.3 -> 2.4. For the release script.
 
-Exit status: 0 ok; 1 not a git repo (--build-number); 2 git timed out on the tag
-lookup even after retries — it prints an error to stderr and NOTHING to stdout,
-so a caller (`release.sh`, a build script) fails instead of getting `NOVERSION`.
+Exit status: 0 ok; 1 not a git repo (--build-number); 2 usage error, or git timed
+out on the tag lookup even after retries (error on stderr, NOTHING on stdout, so
+a caller like `release.sh` fails instead of getting `NOVERSION`); 3 an illegal
+tag request (`--increment` backwards / nothing to promote; `--increment-minor`
+over a pre-release) — also nothing on stdout.
 
 `--increment-*` emit a bare, directly-taggable string for the release script
 (no commit/branch/dirty/OS): `3.0`, or `<component>-3.0` with --component. With
@@ -190,11 +192,14 @@ def _short_app(app_version: str) -> str:
     return f"{mm}{stage}{n}" if stage else mm
 
 
-def latest_program_tag(cwd: Optional[str], component: Optional[str] = None) -> Optional[str]:
+def latest_program_tag(cwd: Optional[str], component: Optional[str] = None,
+                       merged: bool = False) -> Optional[str]:
     # Highest version of ANY stage (release or pre-release), compared in Python
     # (git's version sort would put 0.9 below 0.9b1). Mirrors versioning.py.
+    # merged=True: only tags reachable from HEAD (what a BUILD's version uses);
+    # the default (all tags) picks the NEXT tag number so none is issued twice.
     pattern = _program_tag_re(component)
-    out = _git(["tag"], cwd, strict=True)
+    out = _git(["tag", *(["--merged", "HEAD"] if merged else [])], cwd, strict=True)
     if not out:
         return None
     found = [m.group(1) for line in out.splitlines()
@@ -211,7 +216,7 @@ def _resolve_app_version(cwd: Optional[str], component: Optional[str]) -> str:
     # Latest tag of any stage, or — once HEAD is ahead of it — the NEXT STEP in
     # the same program: release 0.8 -> 0.9, pre-release 0.9b2 -> 0.9b3.
     # Mirrors versioning.py's _resolve_app_version.
-    tag = latest_program_tag(cwd, component)
+    tag = latest_program_tag(cwd, component, merged=True)
     if tag is None:
         return NO_VERSION
     ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
@@ -271,29 +276,43 @@ def latest_versions(cwd: Optional[str]):
         if match:
             result.setdefault(match.group(1), match.group(2))
     return result
+_ANY_PROGRAM_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)$")
+
+
+def latest_programs(cwd: Optional[str]):
+    # Highest version of ANY stage per component (None key = bare lineage).
+    out = _git(["tag"], cwd, strict=True)
+    result = {}
+    if not out:
+        return result
+    for line in out.splitlines():
+        m = _ANY_PROGRAM_TAG_RE.match(line.strip())
+        if not m:
+            continue
+        comp, version = m.group(1), m.group(2)
+        if comp not in result or _program_key(version) > _program_key(result[comp]):
+            result[comp] = version
+    return result
 # --------------------------- end inlined block -----------------------------
 
 
 def next_version(cwd: Optional[str], part: str, component: Optional[str] = None) -> str:
-    """Next tag value derived from the latest tag, for the RELEASE SCRIPT.
-
-    ``part="major"`` bumps major and resets minor to 0 (``2.3`` -> ``3.0``);
-    ``part="minor"`` bumps minor (``2.3`` -> ``2.4``). Extra components are
-    dropped (``1.3.4`` -> ``2.0`` / ``1.4``). With no canonical tag the base
-    is ``0.0``, so the first bump is ``1.0`` (major) or ``0.1`` (minor).
-
-    The result is the bare, directly-taggable string: ``3.0`` with no
-    component, or ``<component>-3.0`` when ``component`` is set (so the
-    release script can ``git tag`` it as-is). It carries no commit / branch /
-    dirty / OS — it's a tag value, not a runtime version string.
-    """
-    base = latest_version_tag(cwd, component)
-    if base:
-        major, minor = (int(n) for n in base.split(".")[:2])
-    else:
+    """Next RELEASE tag for ``part`` major/minor, from the latest tag of any
+    stage. ``minor`` while a pre-release is latest raises ValueError (promote it
+    with ``--increment release``); ``major`` is allowed. No tag bootstraps from
+    ``0.0``. Mirrors versioning.py."""
+    latest = latest_program_tag(cwd, component)
+    pre = f"{component}-" if component else ""
+    if latest is None:
         major, minor = 0, 0
-    version = f"{major + 1}.0" if part == "major" else f"{major}.{minor + 1}"
-    return f"{component}-{version}" if component else version
+    else:
+        base, stage, _ = split_program_version(latest)
+        if stage and part == "minor":
+            raise ValueError(
+                f"{pre}{latest} is a pre-release; use `release` to promote it "
+                f"(a minor bump would skip its program)")
+        major, minor = (int(n) for n in base.split(".")[:2])
+    return pre + (f"{major + 1}.0" if part == "major" else f"{major}.{minor + 1}")
 
 
 _KINDS = {"alpha": "a", "beta": "b", "rc": "rc"}
@@ -336,7 +355,7 @@ def next_program_version(cwd: Optional[str], kind: str, component: Optional[str]
 
 def _describe(cwd: Optional[str], component: Optional[str], stream) -> None:
     """Print the version derivation to `stream` (for --verbose); stdout stays clean."""
-    tag = latest_program_tag(cwd, component)
+    tag = latest_program_tag(cwd, component, merged=True)
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
     commit = _git(["rev-parse", "--short", "HEAD"], cwd)
     on_trunk = branch in _DEFAULT_MAIN_BRANCHES or branch in (None, "HEAD")
@@ -349,6 +368,11 @@ def _describe(cwd: Optional[str], component: Optional[str], stream) -> None:
           f"{' (omitted — trunk)' if on_trunk else ''}", file=stream)
     print(f"  commit:    {commit or '<unknown>'}", file=stream)
     print(f"  dirty:     {'yes' if _is_dirty(cwd) else 'no'}", file=stream)
+
+
+#: Exit statuses: 0 ok; 1 not a git repo (--build-number); 2 usage error or git
+#: timed out (no version printed); 3 an illegal tag request (see --increment).
+EXIT_ILLEGAL_MOVE = 3
 
 
 def main() -> int:
@@ -388,7 +412,7 @@ def _main() -> int:
                       help="Print the next tag for a pre-release program: alpha, "
                            "beta, rc, or release (promote the current pre-release). "
                            "E.g. 0.8 -> alpha 0.9a1; 0.9a2 -> beta 0.9b1; "
-                           "0.9rc1 -> release 0.9. Refuses illegal moves (exit 1).")
+                           "0.9rc1 -> release 0.9. Refuses illegal moves (exit 3).")
     mode.add_argument("--increment-major", action="store_true",
                       help="Print the next major version (major+1, minor=0) from "
                            "the latest tag, e.g. 2.3 -> 3.0. For the release script.")
@@ -404,7 +428,7 @@ def _main() -> int:
         _describe(cwd, component, sys.stderr)
 
     if args.list:
-        versions = latest_versions(cwd)
+        versions = latest_programs(cwd)  # any stage: matches what builds use
         if not versions:
             print("(no version tags)")
             return 0
@@ -440,15 +464,15 @@ def _main() -> int:
             print(next_program_version(cwd, args.increment, component))
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
-            return 1
+            return EXIT_ILLEGAL_MOVE
         return 0
 
-    if args.increment_major:
-        print(next_version(cwd, "major", component))
-        return 0
-
-    if args.increment_minor:
-        print(next_version(cwd, "minor", component))
+    if args.increment_major or args.increment_minor:
+        try:
+            print(next_version(cwd, "major" if args.increment_major else "minor", component))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return EXIT_ILLEGAL_MOVE
         return 0
 
     print(canonical_version(cwd, component))
