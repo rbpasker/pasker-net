@@ -43,6 +43,11 @@ Options:
                        `2.0-767`; `+` = dirty)
     --build-number     instead print `git rev-list --count HEAD` (the
                        monotonic integer for Apple CFBundleVersion)
+    --increment PROGRAM  print the next tag for a pre-release program (alpha, beta,
+                       rc, or release to promote): 0.8 -> alpha 0.9a1, 0.9a2 ->
+                       beta 0.9b1, 0.9rc1 -> release 0.9. Refuses illegal moves
+                       (e.g. alpha after beta) with exit 1. Pre-release tags are
+                       `<X.x>a<N>` / `b<N>` / `rc<N>`; they sort below release X.x.
     --increment-major  print the next major version (major+1, minor=0) from
                        the latest tag, e.g. 2.3 -> 3.0. For the release script.
     --increment-minor  print the next minor version (minor+1) from the latest
@@ -83,6 +88,9 @@ class GitError(RuntimeError):
     be indistinguishable from a real answer (tag lookup -> NOVERSION)."""
 NO_VERSION = "NOVERSION"
 CANONICAL_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)$")
+# Pre-release programs: `<X.x><a|b|rc><N>` (alpha/beta/rc) sorts below release X.x.
+PRE_STAGES = ("a", "b", "rc")
+PROGRAM_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)(?:(a|b|rc)(\d+))?$")
 # Parses any version tag into (component, version); component is None for bare.
 _ANY_VERSION_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+)$")
 
@@ -154,21 +162,63 @@ def latest_version_tag(cwd: Optional[str], component: Optional[str] = None) -> O
     return None
 
 
+def _program_tag_re(component: Optional[str]):
+    body = r"(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)"
+    if not component:
+        return re.compile(r"^" + body + r"$")
+    return re.compile(r"^" + re.escape(component) + r"-" + body + r"$")
+
+
+def split_program_version(version: str):
+    m = PROGRAM_VERSION_RE.match(version)
+    if not m:
+        return version, None, None
+    return m.group(1), m.group(2), (int(m.group(3)) if m.group(3) else None)
+
+
+def _program_key(version: str):
+    base, stage, n = split_program_version(version)
+    rank = PRE_STAGES.index(stage) if stage else len(PRE_STAGES)
+    return (tuple(int(x) for x in base.split(".")), rank, n or 0)
+
+
+def _short_app(app_version: str) -> str:
+    if not PROGRAM_VERSION_RE.match(app_version):
+        return app_version
+    base, stage, n = split_program_version(app_version)
+    mm = ".".join(base.split(".")[:2])
+    return f"{mm}{stage}{n}" if stage else mm
+
+
+def latest_program_tag(cwd: Optional[str], component: Optional[str] = None) -> Optional[str]:
+    # Highest version of ANY stage (release or pre-release), compared in Python
+    # (git's version sort would put 0.9 below 0.9b1). Mirrors versioning.py.
+    pattern = _program_tag_re(component)
+    out = _git(["tag"], cwd, strict=True)
+    if not out:
+        return None
+    found = [m.group(1) for line in out.splitlines()
+             if (m := pattern.match(line.strip()))]
+    return max(found, key=_program_key) if found else None
+
+
 def _next_minor(version: str) -> str:
     major, minor = (int(n) for n in version.split(".")[:2])
     return f"{major}.{minor + 1}"
 
 
 def _resolve_app_version(cwd: Optional[str], component: Optional[str]) -> str:
-    # Latest tag, or the NEXT MINOR once HEAD is ahead of it (development toward
-    # the next release). Mirrors versioning.py's _resolve_app_version.
-    tag = latest_version_tag(cwd, component)
+    # Latest tag of any stage, or — once HEAD is ahead of it — the NEXT STEP in
+    # the same program: release 0.8 -> 0.9, pre-release 0.9b2 -> 0.9b3.
+    # Mirrors versioning.py's _resolve_app_version.
+    tag = latest_program_tag(cwd, component)
     if tag is None:
         return NO_VERSION
     ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
     since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd, strict=True)
     if since is not None and since.isdigit() and int(since) > 0:
-        return _next_minor(tag)
+        base, stage, n = split_program_version(tag)
+        return f"{base}{stage}{n + 1}" if stage else _next_minor(tag)
     return tag
 
 
@@ -202,7 +252,7 @@ def build_number(cwd: Optional[str]) -> Optional[int]:
 
 
 def short_version(cwd: Optional[str], component: Optional[str] = None) -> str:
-    mm = ".".join(_resolve_app_version(cwd, component).split(".")[:2])
+    mm = _short_app(_resolve_app_version(cwd, component))
     seq = build_number(cwd)
     if seq is None:
         return f"{mm}-unknown"
@@ -246,9 +296,47 @@ def next_version(cwd: Optional[str], part: str, component: Optional[str] = None)
     return f"{component}-{version}" if component else version
 
 
+_KINDS = {"alpha": "a", "beta": "b", "rc": "rc"}
+
+
+def next_program_version(cwd: Optional[str], kind: str, component: Optional[str] = None) -> str:
+    """Next tag for advancing a program, for the RELEASE SCRIPT. ``kind`` is
+    ``alpha`` / ``beta`` / ``rc`` / ``release``; raises ``ValueError`` on an
+    illegal move. From the latest tag of any stage:
+
+    * release ``0.8``: alpha/beta/rc start the next minor (``0.9a1`` / ``0.9b1``
+      / ``0.9rc1``); ``release`` is refused (nothing to promote).
+    * pre-release ``0.9a2``: same kind -> ``0.9a3``; a LATER stage starts it
+      (``beta`` -> ``0.9b1``); ``release`` promotes it to ``0.9``; an EARLIER
+      stage is refused (no going backwards).
+    * no tag: bootstraps from ``0.0`` (``alpha`` -> ``0.1a1``); ``release``
+      is refused.
+
+    Returned bare (or ``<component>-…``), directly taggable."""
+    if kind != "release" and kind not in _KINDS:
+        raise ValueError(f"unknown program {kind!r} (alpha|beta|rc|release)")
+    latest = latest_program_tag(cwd, component)
+    pre = "" if component is None else f"{component}-"
+    if latest is None:
+        if kind == "release":
+            raise ValueError("no tag to promote to a release")
+        return f"{pre}0.1{_KINDS[kind]}1"
+    base, stage, n = split_program_version(latest)
+    if stage is None:  # latest is a release
+        if kind == "release":
+            raise ValueError(f"{pre}{latest} is already a release; nothing to promote")
+        return f"{pre}{_next_minor(latest)}{_KINDS[kind]}1"
+    if kind == "release":
+        return f"{pre}{base}"
+    want = _KINDS[kind]
+    if PRE_STAGES.index(want) < PRE_STAGES.index(stage):
+        raise ValueError(f"cannot go back from {pre}{latest} to {kind}")
+    return f"{pre}{base}{want}{n + 1 if want == stage else 1}"
+
+
 def _describe(cwd: Optional[str], component: Optional[str], stream) -> None:
     """Print the version derivation to `stream` (for --verbose); stdout stays clean."""
-    tag = latest_version_tag(cwd, component)
+    tag = latest_program_tag(cwd, component)
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
     commit = _git(["rev-parse", "--short", "HEAD"], cwd)
     on_trunk = branch in _DEFAULT_MAIN_BRANCHES or branch in (None, "HEAD")
@@ -295,6 +383,12 @@ def _main() -> int:
     mode.add_argument("--build-number", action="store_true",
                       help="Instead print `git rev-list --count HEAD` "
                            "(the monotonic integer for Apple CFBundleVersion).")
+    mode.add_argument("--increment", choices=["alpha", "beta", "rc", "release"],
+                      metavar="PROGRAM",
+                      help="Print the next tag for a pre-release program: alpha, "
+                           "beta, rc, or release (promote the current pre-release). "
+                           "E.g. 0.8 -> alpha 0.9a1; 0.9a2 -> beta 0.9b1; "
+                           "0.9rc1 -> release 0.9. Refuses illegal moves (exit 1).")
     mode.add_argument("--increment-major", action="store_true",
                       help="Print the next major version (major+1, minor=0) from "
                            "the latest tag, e.g. 2.3 -> 3.0. For the release script.")
@@ -339,6 +433,14 @@ def _main() -> int:
             print("error: not a git repo, or git unavailable", file=sys.stderr)
             return 1
         print(n)
+        return 0
+
+    if args.increment:
+        try:
+            print(next_program_version(cwd, args.increment, component))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         return 0
 
     if args.increment_major:

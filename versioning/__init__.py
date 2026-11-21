@@ -28,6 +28,12 @@ a version received from elsewhere (a health check reading ``/api/version``).
 (``"2.0-767"``; trailing ``+`` = dirty); :func:`short_from_canonical`
 derives it from a canonical string, as the reference for ports to test against.
 
+Pre-release programs: tags ``0.9a1`` / ``0.9b2`` / ``0.9rc1`` (alpha / beta /
+release candidate) sort below the release ``0.9``. Builds ahead of a tag preview
+the next step in the same program (``0.9b2`` -> ``0.9b3``; release ``0.8`` ->
+``0.9``) and the short form keeps the stage (``0.9b3-70+``). See
+:func:`latest_program_tag`.
+
 A git call that times out is retried; if the tag lookup still can't be answered
 it raises :class:`GitError` (the CLI exits 2 with a message) instead of
 reporting ``NOVERSION``.
@@ -52,14 +58,17 @@ from .versioning import (
     CANONICAL_VERSION_RE,
     GitError,
     NO_VERSION,
+    PRE_STAGES,
     VersionParts,
     build_number,
     canonical_version,
     canonical_version_client,
     current_os,
+    latest_program_tag,
     latest_version_tag,
     latest_versions,
     parse_canonical_version,
+    split_program_version,
     short_from_canonical,
     short_version,
 )
@@ -68,14 +77,17 @@ __all__ = [
     "CANONICAL_VERSION_RE",
     "GitError",
     "NO_VERSION",
+    "PRE_STAGES",
     "VersionParts",
     "build_number",
     "canonical_version",
     "canonical_version_client",
     "current_os",
+    "latest_program_tag",
     "latest_version_tag",
     "latest_versions",
     "parse_canonical_version",
+    "split_program_version",
     "short_from_canonical",
     "short_version",
 ]
