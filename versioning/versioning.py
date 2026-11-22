@@ -624,7 +624,7 @@ def next_version(
         if stage and part == "minor":
             raise ValueError(
                 f"{pre}{latest} is a pre-release; use `release` to promote it "
-                f"(a minor bump would skip its program)")
+                f"(a minor bump would skip it)")
         major, minor = (int(n) for n in base.split(".")[:2])
     return pre + (f"{major + 1}.0" if part == "major" else f"{major}.{minor + 1}")
 
