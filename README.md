@@ -158,6 +158,30 @@ ln -sf "$PWD/secretvault/__main__.py" ~/.local/bin/secretvault
 just copy the file itself onto the other machine — it has no dependency on the
 repo.)
 
+### Syncing through Bitwarden (`sync`)
+
+`secretvault sync` mirrors secrets, and whole files that other programs read
+from fixed paths (e.g. `~/.cloudflared/cert.pem`), through Bitwarden, which
+syncs to all your machines. In the Bitwarden folder `secretvault`, each service
+is one secure note (the `export` JSON bundle) and each file is one secure note
+named by its path under your home directory, which is where `sync` writes it
+back (mode 0600). Needs the Bitwarden CLI (`brew install bitwarden-cli`),
+logged in and unlocked:
+
+```bash
+export BW_SESSION="$(bw unlock --raw)"
+secretvault --service myapp sync                  # add a service (first time only)
+secretvault sync --file ~/.cloudflared/cert.pem   # add a file (first time only)
+secretvault sync                                  # sync everything, both ways
+```
+
+Keys or files only on one side are copied to the other. Ones that differ are
+reported and left alone; `sync --prefer local` or `--prefer bitwarden` says
+which side wins. Files must live under your home directory, so the same
+`~/` path works on every machine. Deletes don't propagate: a key or file
+deleted locally comes back on the next sync unless you also remove it from
+Bitwarden. Only `sync` uses `bw`; apps reading secrets never need it.
+
 ### Moving secrets between machines (export / import)
 
 The login Keychain doesn't sync to iCloud for command-line tools (that needs a

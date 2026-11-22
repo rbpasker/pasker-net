@@ -13,6 +13,7 @@ Usage:
     python -m secretvault --service <name> list
     python -m secretvault --service <name> export [FILE]
     python -m secretvault --service <name> import [FILE]
+    python -m secretvault [--service <name>] sync [--file PATH ...] [--prefer local|bitwarden]
 
 `--service` is required so secrets are namespaced to one consuming app
 (e.g. `--service edmund`, `--service roscoe`). For `set`, omit VALUE to
@@ -37,6 +38,18 @@ back from a file, a pipe, or a heredoc:
     # or pipe / heredoc, no file on disk:
     python -m secretvault --service myapp export | \\
         ssh other 'python -m secretvault --service myapp import'
+
+`sync` does the same through Bitwarden, which syncs to every machine, and
+also carries whole files (e.g. ~/.cloudflared/cert.pem) that other programs
+read from fixed paths. In Bitwarden folder `secretvault`, each service is one
+secure note (named after it, body = the export bundle) and each file is one
+secure note (named by its `~/` path, body = its contents). `sync` syncs
+everything already there, both ways; `--service NAME sync` adds a service and
+`sync --file PATH` adds a file under $HOME. Restored files are written mode
+0600. Keys or files that differ on the two sides are reported and left alone
+unless `--prefer local|bitwarden` says which side wins. Deletes don't
+propagate (delete it in Bitwarden too). Needs the `bw` CLI unlocked:
+export BW_SESSION="$(bw unlock --raw)".
 """
 from __future__ import annotations
 
@@ -48,6 +61,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 # Keychain value encoding — inlined to keep this CLI self-contained. macOS
@@ -410,6 +424,207 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Bitwarden sync -------------------------------------------------------
+# `sync` keeps each service's secrets mirrored in Bitwarden (which syncs to
+# every machine) as one secure note per service — named after the service, in
+# folder `secretvault`, body = the same JSON bundle `export` writes. Files are
+# one secure note each in the same folder, named by their `~/` path (that
+# prefix is what tells a file from a service), body = the file's contents.
+# Only `sync` touches `bw`; apps reading secrets never need it.
+
+_BW_FOLDER = "secretvault"
+
+
+class BwError(RuntimeError):
+    pass
+
+
+def _bw(*args: str) -> str:
+    try:
+        result = subprocess.run(["bw", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise BwError("Bitwarden CLI `bw` not found — brew install bitwarden-cli")
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip()
+        raise BwError(f"bw {args[0]} failed: {msg}")
+    return result.stdout
+
+
+def _bw_json(*args: str):
+    return json.loads(_bw(*args))
+
+
+def _bw_encode(obj: dict) -> str:
+    # Equivalent to piping the JSON through `bw encode`.
+    return base64.b64encode(json.dumps(obj).encode("utf-8")).decode("ascii")
+
+
+def _bundle_text(service: str, secrets: dict) -> str:
+    return json.dumps({"service": service, "secrets": secrets},
+                      indent=2, sort_keys=True) + "\n"
+
+
+def _sync_service(service: str, item: "dict | None", folder_id: str,
+                  prefer: "str | None") -> bool:
+    """Two-way merge of one service. Returns False if anything was left unresolved."""
+    remote: dict[str, str] = {}
+    if item is not None:
+        try:
+            remote = json.loads(item.get("notes") or "{}").get("secrets", {})
+        except (json.JSONDecodeError, AttributeError):
+            print(f"{service}: Bitwarden note is not a secretvault bundle; skipped",
+                  file=sys.stderr)
+            return False
+        remote = {k: v for k, v in remote.items() if isinstance(v, str)}
+
+    vault = KeychainVault(service=service)
+    local = {}
+    for acct in _accounts_for_service(service):
+        value = vault.get(acct)
+        if value is not None:
+            local[acct] = value
+
+    merged = dict(remote)
+    pushed, pulled, conflicts = [], [], []
+    for key in sorted(set(local) | set(remote)):
+        lv, rv = local.get(key), remote.get(key)
+        if lv == rv:
+            continue
+        if rv is None or (lv is not None and prefer == "local"):
+            merged[key] = lv
+            pushed.append(key)
+        elif lv is None or prefer == "bitwarden":
+            vault.set(key, rv)
+            pulled.append(key)
+        else:
+            conflicts.append(key)
+
+    if item is None or merged != remote:
+        _upsert_note(item, service, _bundle_text(service, merged), folder_id)
+
+    parts = []
+    if pushed:
+        parts.append(f"→ bitwarden: {', '.join(pushed)}")
+    if pulled:
+        parts.append(f"→ keychain: {', '.join(pulled)}")
+    print(f"{service}: " + ("; ".join(parts) if parts else "in sync"))
+    if conflicts:
+        print(f"{service}: differ in Keychain and Bitwarden, left unchanged "
+              f"(rerun with --prefer local|bitwarden): {', '.join(conflicts)}",
+              file=sys.stderr)
+    return not conflicts
+
+
+def _note_name(path: str) -> str:
+    """``~/rel/path`` for a file under $HOME; refuses anything outside it."""
+    home = Path.home().resolve()
+    p = Path(path).expanduser().resolve()
+    try:
+        rel = p.relative_to(home)
+    except ValueError:
+        raise BwError(f"{path}: not under your home directory ({home})")
+    return f"~/{rel.as_posix()}"
+
+
+def _file_path(name: str) -> Path:
+    """Inverse of _note_name; refuses a note name that escapes $HOME."""
+    home = Path.home().resolve()
+    p = (home / name[2:]).resolve()
+    if home not in p.parents:
+        raise BwError(f"refusing note {name!r}: path escapes home directory")
+    return p
+
+
+def _upsert_note(item: "dict | None", name: str, body: str, folder_id: str) -> None:
+    if item is None:
+        stored = _bw_json("create", "item", _bw_encode({
+            "type": 2, "secureNote": {"type": 0}, "folderId": folder_id,
+            "organizationId": None, "name": name, "notes": body,
+            "favorite": False, "fields": [], "reprompt": 0,
+        }))
+    else:
+        stored = _bw_json("edit", "item", item["id"],
+                          _bw_encode({**item, "notes": body}))
+    if stored.get("notes") != body:
+        print(f"{name}: WARNING Bitwarden did not store it byte-for-byte",
+              file=sys.stderr)
+
+
+def _sync_file(name: str, item: "dict | None", folder_id: str,
+               prefer: "str | None") -> bool:
+    """Two-way sync of one file. Returns False if left unresolved."""
+    try:
+        path = _file_path(name)
+        local = path.read_text(encoding="utf-8") if path.exists() else None
+    except (BwError, OSError, UnicodeDecodeError) as exc:
+        print(f"{name}: {exc}; skipped", file=sys.stderr)
+        return False
+    remote = item.get("notes") if item is not None else None
+    if local is None and remote is None:
+        print(f"{name}: no such file here or in Bitwarden", file=sys.stderr)
+        return False
+    if local == remote:
+        print(f"{name}: in sync")
+        return True
+    if remote is None or (local is not None and prefer == "local"):
+        if not local:
+            print(f"{name}: empty file; skipped", file=sys.stderr)
+            return False
+        _upsert_note(item, name, local, folder_id)
+        print(f"{name}: → bitwarden")
+    elif local is None or prefer == "bitwarden":
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".secretvault-tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(remote)
+        os.replace(tmp, path)
+        print(f"{name}: → file (mode 0600)")
+    else:
+        print(f"{name}: differs locally and in Bitwarden, left unchanged "
+              f"(rerun with --prefer local|bitwarden)", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Two-way sync of every service and file in Bitwarden, plus any added."""
+    nothing = ("nothing to sync yet; add a service with `secretvault --service "
+               "NAME sync` or a file with `secretvault sync --file PATH`")
+    try:
+        added_files = {_note_name(f) for f in args.files}
+        status = _bw_json("status").get("status")
+        if status != "unlocked":
+            hint = ("bw login" if status == "unauthenticated"
+                    else 'export BW_SESSION="$(bw unlock --raw)"')
+            raise BwError(f"Bitwarden vault is {status}; run: {hint}")
+        _bw("sync")
+        folder_id = next((f["id"] for f in _bw_json("list", "folders", "--search", _BW_FOLDER)
+                          if f.get("name") == _BW_FOLDER), None)
+        if folder_id is None:
+            if not args.service and not added_files:
+                print(nothing)
+                return 0
+            folder_id = _bw_json("create", "folder", _bw_encode({"name": _BW_FOLDER}))["id"]
+        items = {i["name"]: i for i in _bw_json("list", "items", "--folderid", folder_id)
+                 if i.get("type") == 2}
+        files = sorted({n for n in items if n.startswith("~/")} | added_files)
+        services = sorted({n for n in items if not n.startswith("~/")}
+                          | ({args.service} if args.service else set()))
+        if not services and not files:
+            print(nothing)
+            return 0
+        ok = True
+        for service in services:
+            ok = _sync_service(service, items.get(service), folder_id, args.prefer) and ok
+        for name in files:
+            ok = _sync_file(name, items.get(name), folder_id, args.prefer) and ok
+        return 0 if ok else 1
+    except BwError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="python -m secretvault",
@@ -421,7 +636,14 @@ def main() -> int:
             "  /usr/bin/security. The login keychain does NOT sync to iCloud\n"
             "  (command-line tools can't write the iCloud Keychain without a\n"
             "  signed, provisioned app), so to move secrets to another machine\n"
-            "  use `export` / `import`.\n"
+            "  use `sync` (via Bitwarden) or `export` / `import`.\n"
+            "\n"
+            "  `sync` mirrors every service and file in Bitwarden folder\n"
+            "  'secretvault' both ways (needs the `bw` CLI, logged in and\n"
+            "  unlocked via BW_SESSION); `--service NAME sync` adds a service,\n"
+            "  `sync --file PATH` adds a file under $HOME (restored mode 0600).\n"
+            "  Deleting a key or file locally does not delete it from\n"
+            "  Bitwarden — the next sync restores it.\n"
             "\n"
             "  `export FILE` writes a plaintext JSON bundle, then locks it to\n"
             "  root (mode 0400) so it can't be read or imported without sudo;\n"
@@ -431,8 +653,9 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--service", "-s", required=True,
-        help="Keychain service name (namespace your app's secrets)",
+        "--service", "-s", default=None,
+        help="Keychain service name (namespace your app's secrets); required "
+             "except for `sync`, where it adds that service to the sync set",
     )
     subs = parser.add_subparsers(dest="command", required=True)
 
@@ -478,7 +701,19 @@ def main() -> int:
                    help="overwrite keys that already exist (default: skip them)")
     p.set_defaults(func=cmd_import)
 
+    p = subs.add_parser("sync", help="two-way sync with Bitwarden (all services and "
+                                     "files there, plus --service / --file)")
+    p.add_argument("--file", dest="files", action="append", default=[], metavar="PATH",
+                   help="also sync this file under $HOME (repeatable); adds it "
+                        "to Bitwarden the first time")
+    p.add_argument("--prefer", choices=("local", "bitwarden"), default=None,
+                   help="which side wins for keys or files that differ "
+                        "(default: report them and change neither)")
+    p.set_defaults(func=cmd_sync)
+
     args = parser.parse_args()
+    if args.service is None and args.command != "sync":
+        parser.error("--service is required")
     return args.func(args)
 
 
