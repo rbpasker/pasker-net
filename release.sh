@@ -3,13 +3,13 @@
 # release.sh — cut a release tag for one component, using the versioning tool
 # itself to compute the next version from git tags.
 #
-#   ./release.sh <component> [major|minor|alpha|beta|rc|release]
+#   ./release.sh <component> [major|minor|alpha|beta|release]
 #
 # Examples:
 #   ./release.sh secretvault major     # first release -> secretvault-1.0
 #   ./release.sh queuing minor         # next minor    -> queuing-1.1
 #   ./release.sh queuing alpha         # 1.1 -> queuing-1.2a1 (then alpha again: 1.2a2)
-#   ./release.sh queuing beta          # 1.2a2 -> queuing-1.2b1;  rc -> 1.2rc1
+#   ./release.sh queuing beta          # 1.2a2 -> queuing-1.2b1
 #   ./release.sh queuing release       # promote the pre-release -> queuing-1.2
 #
 # The component scopes the tag namespace (`<component>-<X.x>`), so modules
@@ -18,14 +18,14 @@
 # bump to 0.1. The tag is created on the current HEAD and pushed to origin.
 set -euo pipefail
 
-usage() { echo "usage: $0 <component> [major|minor|alpha|beta|rc|release]   (default: minor)" >&2; exit 2; }
+usage() { echo "usage: $0 <component> [major|minor|alpha|beta|release]   (default: minor)" >&2; exit 2; }
 
 COMPONENT="${1:-}"; [ -n "$COMPONENT" ] || usage
 BUMP="${2:-minor}"
 case "$BUMP" in
   major) FLAG=--increment-major ;;
   minor) FLAG=--increment-minor ;;
-  alpha|beta|rc|release) FLAG="--increment $BUMP" ;;
+  alpha|beta|release) FLAG="--increment $BUMP" ;;
   *)     usage ;;
 esac
 

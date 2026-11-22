@@ -19,9 +19,10 @@ The emitted file declares an ``enum`` (Swift's idiomatic namespace) with:
   * ``build`` — ``<app>-<revNumber>`` clean; a dirty build appends
     ``[-<branch>]-dirty (<buildTime>)`` (a Zulu-time stamp). Mirrors the Python
     ``canonical_version_client`` (rev, no commit hash).
-  * ``programSuffix`` / ``tagAppVersion`` — the pre-release stage (``b3``) and
-    tag-derived version, baked from the git tags (Apple's plist version can't hold
-    a stage); ``build`` appends the suffix: ``0.9b3-70``
+  * ``buildKind`` / ``buildSuffix`` / ``tagAppVersion`` — the build kind (``d`` /
+    ``a`` / ``b`` / empty), kind + number (``b3``) and tag-derived version, baked
+    from the git tags (Apple's plist version can't hold a kind); ``build``
+    appends the suffix: ``0.9b3-70``, ``0.10d-71``
   * ``full`` — ``<build> (<os>)``
 
 Note: ``#if os(iOS)`` is true on iPad as well — Swift has no
@@ -53,7 +54,8 @@ from pathlib import Path
 # Allow running as a script without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from versioning.versioning import (  # noqa: E402
-    _git, _is_dirty, _resolve_app_version, build_number, split_program_version,
+    _git, _is_dirty, _resolve_app_version, _stage_suffix, build_kind, build_number,
+    split_program_version,
 )
 
 
@@ -76,11 +78,16 @@ enum {type_name} {{
     /// recoverable from its commit; a dirty build has no commit to point at.
     static let buildTime = "{build_time}"
 
-    /// Pre-release stage of this build, from the git tags: "" for a release or
-    /// development build, "a1" / "b3" / "rc2" for an alpha / beta / rc. Apple
-    /// requires CFBundleShortVersionString to be digits and dots only, so the
-    /// stage cannot live in the plist — it is baked here and appended in `build`.
-    static let programSuffix = "{program_suffix}"
+    /// Build kind, from the git tags: "d" development (any build ahead of a tag),
+    /// "a" alpha, "b" beta, "" release. What a kind means to the app (update
+    /// channel, audience) is the app's business — compare this, don't parse it.
+    static let buildKind = "{build_kind}"
+
+    /// The kind plus its tag number: "" release, "d" development, "a1" / "b3" for
+    /// an alpha / beta. Apple requires CFBundleShortVersionString to be digits and
+    /// dots only, so this cannot live in the plist — it is baked here and appended
+    /// in `build`.
+    static let buildSuffix = "{build_suffix}"
 
     /// The app version the git tags imply for this build ("0.9b3", "0.10", "0.8").
     /// Compare its release part with `appVersion` to catch a plist whose
@@ -105,12 +112,12 @@ enum {type_name} {{
         return a == t
     }}
 
-    /// Clean: "<X.x><stage>-<revNumber>" — Apple's "X.x (revNumber)" with the
-    /// pre-release stage (if any) after the version, e.g. "0.9b3-70".
+    /// Clean: "<X.x><kind>-<revNumber>" — Apple's "X.x (revNumber)" with the
+    /// build kind (if any) after the version, e.g. "0.9b3-70" or "0.10d-71".
     /// Dirty: appends "-[<branch>-]dirty (<buildTime>)" (branch omitted on a
     /// trunk branch / detached HEAD).
     static var build: String {{
-        var s = "\\(appVersion)\\(programSuffix)-\\(revNumber)"
+        var s = "\\(appVersion)\\(buildSuffix)-\\(revNumber)"
         if gitDirty {{
             if !gitBranch.isEmpty, gitBranch != "HEAD", !mainBranches.contains(gitBranch) {{
                 s += "-\\(gitBranch)"
@@ -166,7 +173,8 @@ def emit(
     # Raises GitError if the tag lookup times out (fails the build loudly, not NOVERSION).
     tag_version = _resolve_app_version(cwd, component)
     _, stage, number = split_program_version(tag_version)
-    program_suffix = f"{stage}{number}" if stage else ""
+    suffix = _stage_suffix(stage, number)
+    kind = build_kind(tag_version)
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd) or ""
     commit = _git(["rev-parse", "--short", "HEAD"], cwd) or "unknown"
     dirty = _is_dirty(cwd)
@@ -182,7 +190,8 @@ def emit(
         git_dirty="true" if dirty else "false",
         rev_number=rev,
         build_time=_swift_escape(build_time),
-        program_suffix=program_suffix,
+        build_suffix=suffix,
+        build_kind=kind,
         tag_app_version=_swift_escape(tag_version),
         main_branches=", ".join(f'"{_swift_escape(b)}"' for b in main_branches),
     )

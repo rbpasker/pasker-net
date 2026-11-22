@@ -39,15 +39,18 @@ Options:
     --list             list every component's latest version (any stage,
                        pre-releases included) and the commit it was cut at: `<component>  <X.x>  <sha>`, one per line
                        (the bare lineage shows as `(bare)`)
+    --build-kind       instead print this build's kind: `d` development, `a`
+                       alpha, `b` beta, or an empty line for a release
     --short            instead print the short form `M.m-seq[+]` (e.g.
                        `2.0-767`; `+` = dirty)
     --build-number     instead print `git rev-list --count HEAD` (the
                        monotonic integer for Apple CFBundleVersion)
-    --increment PROGRAM  print the next tag for a pre-release program (alpha, beta,
-                       rc, or release to promote): 0.8 -> alpha 0.9a1, 0.9a2 ->
-                       beta 0.9b1, 0.9rc1 -> release 0.9. Refuses illegal moves
-                       (e.g. alpha after beta) with exit 3. Pre-release tags are
-                       `<X.x>a<N>` / `b<N>` / `rc<N>`; they sort below release X.x.
+    --increment KIND   print the next tag for a pre-release: alpha, beta, or
+                       release to promote the current pre-release: 0.8 -> alpha
+                       0.9a1, 0.9a2 -> beta 0.9b1, 0.9b2 -> release 0.9. Refuses
+                       illegal moves (e.g. alpha after beta) with exit 3.
+                       Pre-release tags are `<X.x>a<N>` / `b<N>`; they sort
+                       below release X.x.
     --increment-major  print the next major version (major+1, minor=0) from
                        the latest tag, e.g. 2.3 -> 3.0. For the release script.
     --increment-minor  print the next minor version (minor+1) from the latest
@@ -90,9 +93,10 @@ class GitError(RuntimeError):
     be indistinguishable from a real answer (tag lookup -> NOVERSION)."""
 NO_VERSION = "NOVERSION"
 CANONICAL_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)$")
-# Pre-release programs: `<X.x><a|b|rc><N>` (alpha/beta/rc) sorts below release X.x.
-PRE_STAGES = ("a", "b", "rc")
-PROGRAM_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)(?:(a|b|rc)(\d+))?$")
+# Build kinds: `<X.x>a<N>` alpha / `b<N>` beta TAGS sort below release X.x; a build
+# ahead of a tag gets suffix `d` (development), never a valid tag.
+PRE_STAGES = ("a", "b")
+PROGRAM_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)(?:(a|b)(\d+)|(d))?$")
 # Parses any version tag into (component, version); component is None for bare.
 _ANY_VERSION_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+)$")
 
@@ -165,7 +169,7 @@ def latest_version_tag(cwd: Optional[str], component: Optional[str] = None) -> O
 
 
 def _program_tag_re(component: Optional[str]):
-    body = r"(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)"
+    body = r"(\d+(?:\.\d+)+(?:(?:a|b)\d+)?)"
     if not component:
         return re.compile(r"^" + body + r"$")
     return re.compile(r"^" + re.escape(component) + r"-" + body + r"$")
@@ -175,12 +179,20 @@ def split_program_version(version: str):
     m = PROGRAM_VERSION_RE.match(version)
     if not m:
         return version, None, None
-    return m.group(1), m.group(2), (int(m.group(3)) if m.group(3) else None)
+    return m.group(1), m.group(2) or m.group(4), (int(m.group(3)) if m.group(3) else None)
+
+
+def build_kind(app_version: str) -> str:
+    return (split_program_version(app_version)[1] or "") if PROGRAM_VERSION_RE.match(app_version) else ""
+
+
+def _stage_suffix(stage, n) -> str:
+    return f"{stage}{n if n is not None else ''}" if stage else ""
 
 
 def _program_key(version: str):
     base, stage, n = split_program_version(version)
-    rank = PRE_STAGES.index(stage) if stage else len(PRE_STAGES)
+    rank = (-1 if stage == "d" else PRE_STAGES.index(stage)) if stage else len(PRE_STAGES)
     return (tuple(int(x) for x in base.split(".")), rank, n or 0)
 
 
@@ -189,7 +201,7 @@ def _short_app(app_version: str) -> str:
         return app_version
     base, stage, n = split_program_version(app_version)
     mm = ".".join(base.split(".")[:2])
-    return f"{mm}{stage}{n}" if stage else mm
+    return mm + _stage_suffix(stage, n)
 
 
 def latest_program_tag(cwd: Optional[str], component: Optional[str] = None,
@@ -213,8 +225,8 @@ def _next_minor(version: str) -> str:
 
 
 def _resolve_app_version(cwd: Optional[str], component: Optional[str]) -> str:
-    # Latest tag of any stage, or — once HEAD is ahead of it — the NEXT STEP in
-    # the same program: release 0.8 -> 0.9, pre-release 0.9b2 -> 0.9b3.
+    # Latest tag of any stage, or — once HEAD is ahead of it — a DEVELOPMENT
+    # build (suffix d) of the release in flight: 0.8 -> 0.9d, 0.9b2 -> 0.9d.
     # Mirrors versioning.py's _resolve_app_version.
     tag = latest_program_tag(cwd, component, merged=True)
     if tag is None:
@@ -222,8 +234,9 @@ def _resolve_app_version(cwd: Optional[str], component: Optional[str]) -> str:
     ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
     since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd, strict=True)
     if since is not None and since.isdigit() and int(since) > 0:
-        base, stage, n = split_program_version(tag)
-        return f"{base}{stage}{n + 1}" if stage else _next_minor(tag)
+        base, stage, _ = split_program_version(tag)
+        # Ahead of a tag = a DEVELOPMENT build (suffix d) of the release in flight.
+        return f"{base}d" if stage else f"{_next_minor(tag)}d"
     return tag
 
 
@@ -276,7 +289,7 @@ def latest_versions(cwd: Optional[str]):
         if match:
             result.setdefault(match.group(1), match.group(2))
     return result
-_ANY_PROGRAM_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)$")
+_ANY_PROGRAM_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+(?:(?:a|b)\d+)?)$")
 
 
 def latest_programs(cwd: Optional[str]):
@@ -315,16 +328,16 @@ def next_version(cwd: Optional[str], part: str, component: Optional[str] = None)
     return pre + (f"{major + 1}.0" if part == "major" else f"{major}.{minor + 1}")
 
 
-_KINDS = {"alpha": "a", "beta": "b", "rc": "rc"}
+_KINDS = {"alpha": "a", "beta": "b"}
 
 
 def next_program_version(cwd: Optional[str], kind: str, component: Optional[str] = None) -> str:
     """Next tag for advancing a program, for the RELEASE SCRIPT. ``kind`` is
-    ``alpha`` / ``beta`` / ``rc`` / ``release``; raises ``ValueError`` on an
+    ``alpha`` / ``beta`` / ``release``; raises ``ValueError`` on an
     illegal move. From the latest tag of any stage:
 
-    * release ``0.8``: alpha/beta/rc start the next minor (``0.9a1`` / ``0.9b1``
-      / ``0.9rc1``); ``release`` is refused (nothing to promote).
+    * release ``0.8``: alpha/beta start the next minor (``0.9a1`` / ``0.9b1``);
+      ``release`` is refused (nothing to promote).
     * pre-release ``0.9a2``: same kind -> ``0.9a3``; a LATER stage starts it
       (``beta`` -> ``0.9b1``); ``release`` promotes it to ``0.9``; an EARLIER
       stage is refused (no going backwards).
@@ -333,7 +346,7 @@ def next_program_version(cwd: Optional[str], kind: str, component: Optional[str]
 
     Returned bare (or ``<component>-…``), directly taggable."""
     if kind != "release" and kind not in _KINDS:
-        raise ValueError(f"unknown program {kind!r} (alpha|beta|rc|release)")
+        raise ValueError(f"unknown build kind {kind!r} (alpha|beta|release)")
     latest = latest_program_tag(cwd, component)
     pre = "" if component is None else f"{component}-"
     if latest is None:
@@ -402,17 +415,20 @@ def _main() -> int:
     mode.add_argument("--list", action="store_true",
                       help="List every component's latest version, pre-releases included "
                            "(one per line); the bare lineage shows as '(bare)'.")
+    mode.add_argument("--build-kind", action="store_true",
+                      help="Print this build's kind letter: d (development), a "
+                           "(alpha), b (beta), or an empty line for a release.")
     mode.add_argument("--short", action="store_true",
                       help="Print the short form M.m-seq[+] (+ = dirty).")
     mode.add_argument("--build-number", action="store_true",
                       help="Instead print `git rev-list --count HEAD` "
                            "(the monotonic integer for Apple CFBundleVersion).")
-    mode.add_argument("--increment", choices=["alpha", "beta", "rc", "release"],
-                      metavar="PROGRAM",
-                      help="Print the next tag for a pre-release program: alpha, "
-                           "beta, rc, or release (promote the current pre-release). "
-                           "E.g. 0.8 -> alpha 0.9a1; 0.9a2 -> beta 0.9b1; "
-                           "0.9rc1 -> release 0.9. Refuses illegal moves (exit 3).")
+    mode.add_argument("--increment", choices=["alpha", "beta", "release"],
+                      metavar="KIND",
+                      help="Print the next tag for a pre-release: alpha, beta, or "
+                           "release (promote the current pre-release). E.g. 0.8 -> "
+                           "alpha 0.9a1; 0.9a2 -> beta 0.9b1; 0.9b2 -> release 0.9. "
+                           "Refuses illegal moves (exit 3).")
     mode.add_argument("--increment-major", action="store_true",
                       help="Print the next major version (major+1, minor=0) from "
                            "the latest tag, e.g. 2.3 -> 3.0. For the release script.")
@@ -445,6 +461,10 @@ def _main() -> int:
         for comp in labels:
             label = comp if comp is not None else "(bare)"
             print(f"{label:<{name_w}}  {versions[comp]:<{ver_w}}  {_sha(comp, versions[comp])}")
+        return 0
+
+    if args.build_kind:
+        print(build_kind(_resolve_app_version(cwd, component)))
         return 0
 
     if args.short:

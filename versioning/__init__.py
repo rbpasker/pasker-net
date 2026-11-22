@@ -28,11 +28,13 @@ a version received from elsewhere (a health check reading ``/api/version``).
 (``"2.0-767"``; trailing ``+`` = dirty); :func:`short_from_canonical`
 derives it from a canonical string, as the reference for ports to test against.
 
-Pre-release programs: tags ``0.9a1`` / ``0.9b2`` / ``0.9rc1`` (alpha / beta /
-release candidate) sort below the release ``0.9``. Builds ahead of a tag preview
-the next step in the same program (``0.9b2`` -> ``0.9b3``; release ``0.8`` ->
-``0.9``) and the short form keeps the stage (``0.9b3-70+``). See
-:func:`latest_program_tag`.
+Build kinds: every build is one of ``d`` (development), ``a`` (alpha), ``b``
+(beta) or blank (release), derived from the tags reachable from HEAD and written
+as a suffix on the version — ``0.9-70`` release, ``0.9a1-70``, ``0.9b2-70``,
+``0.10d-71`` development (any build ahead of a tag). Alpha/beta tags are
+``0.9a1`` / ``0.9b2`` and sort below the release ``0.9``. :func:`build_kind`
+returns the letter; what a kind means to an app (update channel, audience) is the
+app's business. See :func:`latest_program_tag`.
 
 A git call that times out is retried; if the tag lookup still can't be answered
 it raises :class:`GitError` (the CLI exits 2 with a message) instead of
@@ -60,6 +62,7 @@ from .versioning import (
     NO_VERSION,
     PRE_STAGES,
     VersionParts,
+    build_kind,
     build_number,
     canonical_version,
     canonical_version_client,
@@ -82,6 +85,7 @@ __all__ = [
     "NO_VERSION",
     "PRE_STAGES",
     "VersionParts",
+    "build_kind",
     "build_number",
     "canonical_version",
     "canonical_version_client",

@@ -1,6 +1,7 @@
-"""Tests for pre-release programs: alpha (a) / beta (b) / rc tags that sort
-below the release, previews of the next step in the same program, and the
-`--increment alpha|beta|rc|release` tag computation (plus release.sh)."""
+"""Tests for build kinds: d (development) / a (alpha) / b (beta) / blank (release).
+alpha/beta TAGS sort below the release; a build ahead of any tag is a development
+build (`d`) of the release in flight; and the `--increment alpha|beta|release`
+tag computation (plus release.sh)."""
 from __future__ import annotations
 
 import shutil
@@ -11,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from versioning import (
-    GitError, VersionParts, canonical_version, canonical_version_client, latest_program_tag,
+    GitError, VersionParts, build_kind, canonical_version, canonical_version_client, latest_program_tag,
     latest_programs, latest_version_tag, latest_versions, parse_canonical_version, short_from_canonical,
     short_version, split_program_version,
 )
@@ -43,17 +44,18 @@ def _forms(repo: str, **kw) -> dict:
 class Grammar(unittest.TestCase):
     def test_split(self) -> None:
         self.assertEqual(split_program_version("0.9b2"), ("0.9", "b", 2))
-        self.assertEqual(split_program_version("1.3.4rc1"), ("1.3.4", "rc", 1))
+        self.assertEqual(split_program_version("1.3.4b1"), ("1.3.4", "b", 1))
+        self.assertEqual(split_program_version("0.10d"), ("0.10", "d", None))
         self.assertEqual(split_program_version("0.9a10"), ("0.9", "a", 10))
         self.assertEqual(split_program_version("0.9"), ("0.9", None, None))
         self.assertEqual(split_program_version("NOVERSION"), ("NOVERSION", None, None))
 
     def test_ordering(self) -> None:
-        order = ["0.8", "0.9a1", "0.9a2", "0.9a10", "0.9b1", "0.9rc1", "0.9", "0.10a1", "0.10"]
+        order = ["0.8", "0.9a1", "0.9a2", "0.9a10", "0.9b1", "0.9", "0.10a1", "0.10"]
         self.assertEqual(sorted(reversed(order), key=_program_key), order)
 
     def test_release_outranks_its_prereleases(self) -> None:
-        with _TempRepo("0.9a1", "0.9b2", "0.9rc1", "0.9", "0.8") as repo:
+        with _TempRepo("0.9a1", "0.9b2", "0.9", "0.8") as repo:
             self.assertEqual(latest_program_tag(repo), "0.9")
 
     def test_highest_stage_wins_below_release(self) -> None:
@@ -71,7 +73,8 @@ class Grammar(unittest.TestCase):
             self.assertEqual(latest_program_tag(repo), "0.9b2")
 
     def test_stray_tags_ignored(self) -> None:
-        with _TempRepo("v1.0b1", "2.0-rc1", "0.9beta1", "nightly", "0.8") as repo:
+        # rc and d are not tag kinds; neither are hyphenated / spelled-out forms.
+        with _TempRepo("v1.0b1", "2.0-rc1", "0.9beta1", "0.9rc1", "0.9d", "nightly", "0.8") as repo:
             self.assertEqual(latest_program_tag(repo), "0.8")
 
     def test_component_lineages(self) -> None:
@@ -98,31 +101,50 @@ class Builds(unittest.TestCase):
             (Path(repo) / "a").write_text("wip\n")
             self.assertEqual(_forms(repo)["short"], "0.9b2-1+")
 
-    def test_ahead_of_prerelease_previews_next_number(self) -> None:
+    def test_ahead_of_beta_is_a_development_build_of_that_release(self) -> None:
         with _TempRepo("0.9b2") as repo:
             _commit(repo, "b")
             f = _forms(repo)
-            self.assertEqual(f["short"], "0.9b3-2")
-            self.assertEqual(f["client"], "0.9b3-2")
-            self.assertTrue(f["server"].startswith("0.9b3-2-"))
+            self.assertEqual(f["short"], "0.9d-2")
+            self.assertEqual(f["client"], "0.9d-2")
+            self.assertTrue(f["server"].startswith("0.9d-2-"))
 
-    def test_ahead_of_alpha_stays_alpha(self) -> None:
+    def test_ahead_of_alpha_is_development_too(self) -> None:
         with _TempRepo("0.9a1") as repo:
             _commit(repo, "b")
-            self.assertEqual(_forms(repo)["short"], "0.9a2-2")
+            self.assertEqual(_forms(repo)["short"], "0.9d-2")
 
-    def test_ahead_of_release_after_prereleases_previews_next_minor(self) -> None:
+    def test_ahead_of_release_is_development_of_the_next_minor(self) -> None:
         with _TempRepo("0.9a1", "0.9b1", "0.9") as repo:
             _commit(repo, "b")
-            self.assertEqual(_forms(repo)["short"], "0.10-2")
+            self.assertEqual(_forms(repo)["short"], "0.10d-2")
+
+    def test_dirty_development(self) -> None:
+        with _TempRepo("0.8") as repo:
+            _commit(repo, "b")
+            (Path(repo) / "a").write_text("wip\n")
+            f = _forms(repo)
+            self.assertEqual(f["short"], "0.9d-2+")
+            self.assertTrue(f["server"].endswith("-dirty"))
+            self.assertIn("0.9d-2-dirty", f["client"])
+
+    def test_dirty_at_release_tag_keeps_the_kind(self) -> None:
+        with _TempRepo("0.8") as repo:
+            (Path(repo) / "a").write_text("wip\n")
+            self.assertEqual(_forms(repo)["short"], "0.8-1+")      # still blank, flagged by +
 
     def test_patch_prerelease_short(self) -> None:
-        with _TempRepo("1.3.4rc1") as repo:
-            self.assertEqual(_forms(repo)["short"], "1.3rc1-1")
+        with _TempRepo("1.3.4b1") as repo:
+            self.assertEqual(_forms(repo)["short"], "1.3b1-1")
+
+    def test_no_tags_has_no_kind(self) -> None:
+        with _TempRepo() as repo:
+            _commit(repo, "b")
+            self.assertEqual(_forms(repo)["short"], "NOVERSION-2")
 
     def test_cli_and_library_agree_through_the_program(self) -> None:
         with _TempRepo("0.8") as repo:
-            for tag in ("0.9a1", "0.9a2", "0.9b1", "0.9rc1", "0.9"):
+            for tag in ("0.9a1", "0.9a2", "0.9b1", "0.9"):
                 _commit(repo, tag)
                 f = _forms(repo)
                 self.assertEqual(f["short"], f["cli_short"], tag)
@@ -141,8 +163,8 @@ class Builds(unittest.TestCase):
     def test_component_prerelease_preview(self) -> None:
         with _TempRepo("srv-2.3b1", "cli-1.0") as repo:
             _commit(repo, "b")
-            self.assertEqual(_forms(repo, component="srv")["short"], "2.3b2-2")
-            self.assertEqual(_forms(repo, component="cli")["short"], "1.1-2")
+            self.assertEqual(_forms(repo, component="srv")["short"], "2.3d-2")
+            self.assertEqual(_forms(repo, component="cli")["short"], "1.1d-2")
 
 
 class ParseAndShort(unittest.TestCase):
@@ -151,19 +173,36 @@ class ParseAndShort(unittest.TestCase):
         self.assertEqual((p.app_version, p.rev_number, p.commit, p.dirty, p.os_version),
                          ("0.9b3", 70, "9151ff8", True, "macOS-26.1"))
         self.assertEqual((p.release_version, p.stage, p.pre_number), ("0.9", "b", 3))
+        self.assertEqual(p.build_kind, "b")
 
     def test_release_has_no_stage(self) -> None:
         p = parse_canonical_version("0.9-70-9151ff8")
         self.assertEqual((p.release_version, p.stage, p.pre_number), ("0.9", None, None))
+        self.assertEqual(p.build_kind, "")
         self.assertIsInstance(p, VersionParts)
+
+    def test_development_parses(self) -> None:
+        p = parse_canonical_version("0.10d-71-9151ff8-dirty")
+        self.assertEqual((p.app_version, p.rev_number, p.commit, p.dirty), ("0.10d", 71, "9151ff8", True))
+        self.assertEqual((p.build_kind, p.release_version, p.pre_number), ("d", "0.10", None))
+
+    def test_build_kind_function(self) -> None:
+        for v, want in (("0.9", ""), ("0.9a1", "a"), ("0.9b2", "b"), ("0.10d", "d"),
+                        ("NOVERSION", ""), ("2.0-rc1", ""), ("", "")):
+            with self.subTest(v=v):
+                self.assertEqual(build_kind(v), want)
 
     def test_short_from_canonical_cases(self) -> None:
         cases = {
             "0.9b3-70-9151ff8-dirty": "0.9b3-70+",
             "0.9b3-70-9151ff8": "0.9b3-70",
             "0.9a1-5 (iOS-26.5)": "0.9a1-5",
-            "1.3.4rc1-8-abc1234": "1.3rc1-8",
+            "1.3.4b1-8-abc1234": "1.3b1-8",
             "0.10-71-abc1234": "0.10-71",
+            "0.10d-71-abc1234-dirty": "0.10d-71+",
+            "0.10d-71-abc1234": "0.10d-71",
+            "0.10d-71 (iOS-26.5)": "0.10d-71",
+            "0.10d-unknown": "0.10d-unknown",
             "0.9b3-unknown": "0.9b3-unknown",
             "NOVERSION-46-c7caad6": "NOVERSION-46",
         }
@@ -180,17 +219,14 @@ class NextProgramVersion(unittest.TestCase):
     def test_start_from_release(self) -> None:
         self.assertEqual(self._next(["0.8"], "alpha"), "0.9a1")
         self.assertEqual(self._next(["0.8"], "beta"), "0.9b1")   # skipping a stage is fine
-        self.assertEqual(self._next(["0.8"], "rc"), "0.9rc1")
 
     def test_advance_through_stages(self) -> None:
         self.assertEqual(self._next(["0.9a1"], "alpha"), "0.9a2")
         self.assertEqual(self._next(["0.9a2"], "beta"), "0.9b1")
         self.assertEqual(self._next(["0.9b3"], "beta"), "0.9b4")
-        self.assertEqual(self._next(["0.9b3"], "rc"), "0.9rc1")
-        self.assertEqual(self._next(["0.9a2"], "rc"), "0.9rc1")
 
     def test_promote_to_release(self) -> None:
-        self.assertEqual(self._next(["0.9rc2"], "release"), "0.9")
+        self.assertEqual(self._next(["0.9b2"], "release"), "0.9")
         self.assertEqual(self._next(["0.9a1"], "release"), "0.9")
         self.assertEqual(self._next(["1.3.4b2"], "release"), "1.3.4")
 
@@ -202,19 +238,19 @@ class NextProgramVersion(unittest.TestCase):
         self.assertEqual(self._next(["srv-2.3"], "alpha", "srv"), "srv-2.4a1")
 
     def test_illegal_moves(self) -> None:
-        for tags, kind in ((["0.9b1"], "alpha"), (["0.9rc1"], "beta"),
-                           (["0.9rc1"], "alpha"), (["0.8"], "release"), ([], "release")):
+        for tags, kind in ((["0.9b1"], "alpha"), (["0.8"], "release"), ([], "release")):
             with self.subTest(tags=tags, kind=kind), self.assertRaises(ValueError):
                 self._next(tags, kind)
 
-    def test_unknown_program(self) -> None:
-        with self.assertRaises(ValueError):
-            self._next(["0.8"], "gamma")
+    def test_unknown_kind(self) -> None:
+        for kind in ("gamma", "rc", "d", "development"):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self._next(["0.8"], kind)
 
     def test_full_cycle_previews_the_release_being_built(self) -> None:
         # Each dev preview names the same M.m the tool then says to tag.
         with _TempRepo("0.8") as repo:
-            for i, kind in enumerate(("alpha", "alpha", "beta", "rc", "release")):
+            for i, kind in enumerate(("alpha", "alpha", "beta", "release")):
                 _commit(repo, f"step{i}")
                 preview = _forms(repo)["short"].split("-")[0]
                 nxt = next_program_version(repo, kind)
@@ -235,7 +271,7 @@ class ReachableTagsOnly(unittest.TestCase):
             _git(repo, "tag", "-a", "0.9", "-m", "x")
             _git(repo, "checkout", "-q", older)
             f = _forms(repo)
-            self.assertEqual(f["short"], "0.9-2")  # ahead of 0.8 -> next-minor preview
+            self.assertEqual(f["short"], "0.9d-2")  # development build ahead of 0.8
             self.assertEqual(f["short"], f["cli_short"])
             self.assertEqual(latest_program_tag(repo, merged=True), "0.8")
             self.assertEqual(latest_program_tag(repo), "0.9")  # all tags still seen
@@ -257,7 +293,7 @@ class ReachableTagsOnly(unittest.TestCase):
             _git(repo, "checkout", "-q", main)
             _commit(repo, "m")
             f = _forms(repo)
-            self.assertEqual(f["short"], "0.9-2")  # not 1.1
+            self.assertEqual(f["short"], "0.9d-2")  # not 1.1
             self.assertEqual(f["short"], f["cli_short"])
 
     def test_next_tag_uses_all_tags_so_numbers_are_never_reissued(self) -> None:
@@ -278,7 +314,7 @@ class ReachableTagsOnly(unittest.TestCase):
             _git(repo, "tag", "-a", "0.9b1", "-m", "x")
             _git(repo, "checkout", "-q", main)
             _git(repo, "merge", "-q", "--no-ff", "-m", "merge", "rel")
-            self.assertTrue(_forms(repo)["short"].startswith("0.9b2-"))
+            self.assertTrue(_forms(repo)["short"].startswith("0.9d-"))  # ahead of merged 0.9b1
 
 
 class ListAndDescribe(unittest.TestCase):
@@ -312,7 +348,7 @@ class LibraryAndCliCopyAgree(unittest.TestCase):
     """The CLI inlines its own copy of the library; compare them over many repo states."""
 
     SCENARIOS = [
-        (), ("0.8",), ("0.9a1",), ("0.9b2",), ("1.3.4rc1",), ("0.8", "0.9a3", "0.9b1"),
+        (), ("0.8",), ("0.9a1",), ("0.9b2",), ("1.3.4b1",), ("0.8", "0.9a3", "0.9b1"),
         ("0.9a1", "0.9b1", "0.9"), ("srv-2.3b1", "srv-2.2", "cli-1.0", "0.5a1"),
         ("v1.0", "2.0-rc1", "nightly"),
     ]
@@ -366,11 +402,12 @@ class LibraryAndCliCopyAgree(unittest.TestCase):
     def test_pure_helpers_agree(self) -> None:
         import versioning.__main__ as cli
         import versioning.versioning as lib
-        for v in ("0.9", "0.9b2", "1.3.4rc1", "10.4.1", "NOVERSION", "2.0-rc1", ""):
+        for v in ("0.9", "0.9b2", "1.3.4b1", "10.4.1", "0.10d", "NOVERSION", "2.0-rc1", ""):
             with self.subTest(v=v):
                 self.assertEqual(cli.split_program_version(v), lib.split_program_version(v))
                 self.assertEqual(cli._short_app(v), lib._short_app(v))
-        order = ["0.9", "0.9a1", "0.9b1", "0.9rc1", "0.10a1", "1.0"]
+                self.assertEqual(cli.build_kind(v), lib.build_kind(v))
+        order = ["0.9", "0.9a1", "0.9b1", "0.10a1", "1.0"]
         self.assertEqual(sorted(order, key=cli._program_key), sorted(order, key=lib._program_key))
 
 
@@ -378,11 +415,13 @@ class PartsAsDict(unittest.TestCase):
     def test_as_dict_includes_derived_fields(self) -> None:
         d = parse_canonical_version("0.9b3-70-9151ff8-dirty").as_dict()
         self.assertEqual((d["app_version"], d["release_version"], d["stage"], d["pre_number"],
-                          d["rev_number"], d["dirty"]), ("0.9b3", "0.9", "b", 3, 70, True))
+                          d["rev_number"], d["dirty"], d["build_kind"]),
+                         ("0.9b3", "0.9", "b", 3, 70, True, "b"))
 
     def test_release_as_dict(self) -> None:
         d = parse_canonical_version("0.9-70-9151ff8").as_dict()
-        self.assertEqual((d["stage"], d["pre_number"], d["release_version"]), (None, None, "0.9"))
+        self.assertEqual((d["stage"], d["pre_number"], d["release_version"], d["build_kind"]),
+                         (None, None, "0.9", ""))
 
 
 class SwiftEmitter(unittest.TestCase):
@@ -393,29 +432,35 @@ class SwiftEmitter(unittest.TestCase):
     def test_prerelease_bakes_stage_and_tag_version(self) -> None:
         with _TempRepo("0.9b2") as repo:
             out = self._emit(repo)
-            self.assertIn('static let programSuffix = "b2"', out)
+            self.assertIn('static let buildKind = "b"', out)
+            self.assertIn('static let buildSuffix = "b2"', out)
             self.assertIn('static let tagAppVersion = "0.9b2"', out)
-            self.assertIn(r'"\(appVersion)\(programSuffix)-\(revNumber)"', out)
+            self.assertIn(r'"\(appVersion)\(buildSuffix)-\(revNumber)"', out)
 
-    def test_ahead_of_prerelease_previews_next_number(self) -> None:
+    def test_ahead_of_beta_is_development(self) -> None:
         with _TempRepo("0.9b2") as repo:
             _commit(repo, "x")
             out = self._emit(repo)
-            self.assertIn('programSuffix = "b3"', out)
-            self.assertIn('tagAppVersion = "0.9b3"', out)
+            self.assertIn('buildKind = "d"', out)
+            self.assertIn('buildSuffix = "d"', out)
+            self.assertIn('tagAppVersion = "0.9d"', out)
 
-    def test_release_and_development_have_empty_suffix(self) -> None:
+    def test_release_is_blank_and_development_is_d(self) -> None:
         with _TempRepo("0.8") as repo:
-            self.assertIn('programSuffix = ""', self._emit(repo))
+            out = self._emit(repo)
+            self.assertIn('buildKind = ""', out)
+            self.assertIn('buildSuffix = ""', out)
             _commit(repo, "x")
             out = self._emit(repo)
-            self.assertIn('programSuffix = ""', out)
-            self.assertIn('tagAppVersion = "0.9"', out)
+            self.assertIn('buildKind = "d"', out)
+            self.assertIn('tagAppVersion = "0.9d"', out)
 
     def test_component_lineage(self) -> None:
         with _TempRepo("srv-2.3a1", "cli-1.0") as repo:
-            self.assertIn('programSuffix = "a1"', self._emit(repo, "srv"))
-            self.assertIn('programSuffix = ""', self._emit(repo, "cli"))
+            out = self._emit(repo, "srv")
+            self.assertIn('buildKind = "a"', out)
+            self.assertIn('buildSuffix = "a1"', out)
+            self.assertIn('buildSuffix = ""', self._emit(repo, "cli"))
 
     def test_idempotent(self) -> None:
         with _TempRepo("0.9b2") as repo:
@@ -459,24 +504,22 @@ class LifecycleSimulation(unittest.TestCase):
     def test_alpha_to_release_and_beyond(self) -> None:
         with _TempRepo("0.8") as repo:                    # init commit, tagged 0.8
             steps = [
-                # (action, expected short, expected tag created or None)
-                (None,                 "0.8-1",     None),
-                (("commit", 1),        "0.9-2",     None),
-                (("commit", 1),        "0.9-3",     None),
-                (("tag", "alpha"),     "0.9a1-3",   "0.9a1"),   # tag on this commit
-                (("commit", 1),        "0.9a2-4",   None),
-                (("tag", "alpha"),     "0.9a2-4",   "0.9a2"),
-                (("commit", 1),        "0.9a3-5",   None),
-                (("tag", "beta"),      "0.9b1-5",   "0.9b1"),
-                (("commit", 2),        "0.9b2-7",   None),
-                (("tag", "beta"),      "0.9b2-7",   "0.9b2"),
-                (("commit", 1),        "0.9b3-8",   None),
-                (("tag", "rc"),        "0.9rc1-8",  "0.9rc1"),
-                (("commit", 1),        "0.9rc2-9",  None),
-                (("tag", "release"),   "0.9-9",     "0.9"),
-                (("commit", 1),        "0.10-10",   None),
+                # (action, expected short, tag created or None, expected build kind)
+                (None,                 "0.8-1",     None,    ""),
+                (("commit", 1),        "0.9d-2",    None,    "d"),
+                (("commit", 1),        "0.9d-3",    None,    "d"),
+                (("tag", "alpha"),     "0.9a1-3",   "0.9a1", "a"),   # tag on this commit
+                (("commit", 1),        "0.9d-4",    None,    "d"),
+                (("tag", "alpha"),     "0.9a2-4",   "0.9a2", "a"),
+                (("commit", 1),        "0.9d-5",    None,    "d"),
+                (("tag", "beta"),      "0.9b1-5",   "0.9b1", "b"),
+                (("commit", 2),        "0.9d-7",    None,    "d"),
+                (("tag", "beta"),      "0.9b2-7",   "0.9b2", "b"),
+                (("commit", 1),        "0.9d-8",    None,    "d"),
+                (("tag", "release"),   "0.9-8",     "0.9",   ""),
+                (("commit", 1),        "0.10d-9",   None,    "d"),
             ]
-            for action, want_short, want_tag in steps:
+            for action, want_short, want_tag, want_kind in steps:
                 with self.subTest(action=action):
                     if action:
                         verb, arg = action
@@ -492,6 +535,11 @@ class LifecycleSimulation(unittest.TestCase):
                     self.assertEqual(short_from_canonical(f["server"]), f["short"])
                     self.assertEqual(short_from_canonical(f["client"]), f["short"])
                     self.assertEqual(f["client"], f["short"])  # clean client form == short
+                    self.assertEqual(build_kind(f["short"].split("-")[0]), want_kind)
+                    cli_kind = subprocess.run(
+                        [sys.executable, "-m", "versioning", "--repo-root", repo, "--build-kind"],
+                        capture_output=True, text=True, cwd=str(PROJECT_ROOT)).stdout
+                    self.assertEqual(cli_kind, want_kind + "\n")
 
     def test_dirty_at_a_prerelease_tag(self) -> None:
         with _TempRepo("0.8") as repo:
@@ -604,8 +652,7 @@ class ReleaseScript(unittest.TestCase):
     def test_alpha_then_beta_then_release(self) -> None:
         work, origin = self._setup("comp-0.8")
         for arg, want in (("alpha", "comp-0.9a1"), ("alpha", "comp-0.9a2"),
-                          ("beta", "comp-0.9b1"), ("rc", "comp-0.9rc1"),
-                          ("release", "comp-0.9")):
+                          ("beta", "comp-0.9b1"), ("release", "comp-0.9")):
             r = self._release(work, "comp", arg)
             self.assertEqual(r.returncode, 0, r.stderr)
             tags = _git(str(origin), "tag").split()
@@ -621,7 +668,9 @@ class ReleaseScript(unittest.TestCase):
 
     def test_bad_arg_usage(self) -> None:
         work, _ = self._setup()
-        self.assertEqual(self._release(work, "comp", "gamma").returncode, 2)
+        for bad in ("gamma", "rc", "d"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._release(work, "comp", bad).returncode, 2)
 
 
 if __name__ == "__main__":

@@ -81,21 +81,24 @@ def _version_tag_re(component: Optional[str]) -> "re.Pattern[str]":
     return re.compile(r"^" + re.escape(component) + r"-(\d+(?:\.\d+)+)$")
 
 
-#: Pre-release stages in ascending order, with their tag suffix. A pre-release
-#: tag is ``<X.x><suffix><N>`` — ``0.9a1`` (alpha), ``0.9b2`` (beta),
-#: ``0.9rc1`` (release candidate) — and sorts BELOW the release ``0.9``.
-PRE_STAGES = ("a", "b", "rc")
-STAGE_NAMES = {"a": "alpha", "b": "beta", "rc": "rc"}
+#: Tagged pre-release kinds in ascending order, with their tag suffix. A
+#: pre-release tag is ``<X.x><suffix><N>`` — ``0.9a1`` (alpha), ``0.9b2`` (beta) —
+#: and sorts BELOW the release ``0.9``.
+PRE_STAGES = ("a", "b")
+STAGE_NAMES = {"a": "alpha", "b": "beta"}
 
-#: ``<X.x>[<stage><N>]`` — a bare release or pre-release version. Groups:
-#: 1 = release part (``0.9``), 2 = stage suffix or None, 3 = its number.
-PROGRAM_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)(?:(a|b|rc)(\d+))?$")
+#: ``<X.x>[a<N> | b<N> | d]`` — the app version of a BUILD, whose suffix is its
+#: BUILD KIND: ``a<N>`` alpha, ``b<N>`` beta, ``d`` development, none = release.
+#: Groups: 1 = release part (``0.9``), 2 = ``a``/``b`` with 3 = its tag number, or
+#: 4 = ``d``. ``d`` appears only on a build (commits after a tag) and is never a
+#: valid TAG (see :func:`_program_tag_re`).
+PROGRAM_VERSION_RE = re.compile(r"^(\d+(?:\.\d+)+)(?:(a|b)(\d+)|(d))?$")
 
 
 def _program_tag_re(component: Optional[str]) -> "re.Pattern[str]":
     """Like :func:`_version_tag_re` but also matching pre-release tags; group 1
     is the full version (``0.9b2``), the ``<component>-`` prefix stripped."""
-    body = r"(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)"
+    body = r"(\d+(?:\.\d+)+(?:(?:a|b)\d+)?)"
     if not component:
         return re.compile(r"^" + body + r"$")
     return re.compile(r"^" + re.escape(component) + r"-" + body + r"$")
@@ -107,26 +110,40 @@ def split_program_version(version: str) -> "tuple[str, Optional[str], Optional[i
     m = PROGRAM_VERSION_RE.match(version)
     if not m:
         return version, None, None
-    return m.group(1), m.group(2), (int(m.group(3)) if m.group(3) else None)
+    return m.group(1), m.group(2) or m.group(4), (int(m.group(3)) if m.group(3) else None)
+
+
+def build_kind(app_version: str) -> str:
+    """The BUILD KIND letter of an app version: ``"d"`` development, ``"a"``
+    alpha, ``"b"`` beta, ``""`` release — also ``""`` for anything that isn't a
+    version (``NOVERSION``). How a kind maps to an app's update channel or
+    audience is the app's business; this library only says what kind of build
+    it is."""
+    return (split_program_version(app_version)[1] or "") if PROGRAM_VERSION_RE.match(app_version) else ""
+
+
+def _stage_suffix(stage: Optional[str], n: Optional[int]) -> str:
+    """``("b", 3)`` -> ``"b3"``; ``("d", None)`` -> ``"d"``; no stage -> ``""``."""
+    return f"{stage}{n if n is not None else ''}" if stage else ""
 
 
 def _program_key(version: str) -> tuple:
     """Sort key for a release/pre-release version: numeric parts, then stage
-    rank (alpha < beta < rc < release), then the stage number."""
+    rank (alpha < beta < release), then the stage number."""
     base, stage, n = split_program_version(version)
-    rank = PRE_STAGES.index(stage) if stage else len(PRE_STAGES)
+    rank = (-1 if stage == "d" else PRE_STAGES.index(stage)) if stage else len(PRE_STAGES)
     return (tuple(int(x) for x in base.split(".")), rank, n or 0)
 
 
 def _short_app(app_version: str) -> str:
     """``M.m`` of an app version, keeping a pre-release suffix: ``2.0.1`` ->
-    ``2.0``; ``0.9b3`` -> ``0.9b3``; ``1.3.4rc1`` -> ``1.3rc1``. Non-versions
+    ``2.0``; ``0.9b3`` -> ``0.9b3``; ``1.3.4b1`` -> ``1.3b1``; ``0.10d`` -> ``0.10d``. Non-versions
     (``NOVERSION``) pass through."""
     if not PROGRAM_VERSION_RE.match(app_version):
         return app_version
     base, stage, n = split_program_version(app_version)
     mm = ".".join(base.split(".")[:2])
-    return f"{mm}{stage}{n}" if stage else mm
+    return mm + _stage_suffix(stage, n)
 
 
 class VersionParts(NamedTuple):
@@ -152,22 +169,27 @@ class VersionParts(NamedTuple):
 
     @property
     def stage(self) -> Optional[str]:
-        """Pre-release suffix (``"a"``/``"b"``/``"rc"``) or None for a release /
-        development build. Derived from ``app_version``, so it can't drift."""
+        """Build-kind letter (``"a"``/``"b"``/``"d"``) or None for a release. Derived from ``app_version``, so it can't drift."""
         return split_program_version(self.app_version)[1]
 
     @property
+    def build_kind(self) -> str:
+        """``"d"`` development, ``"a"`` alpha, ``"b"`` beta, ``""`` release — see
+        :func:`build_kind`."""
+        return build_kind(self.app_version)
+
+    @property
     def pre_number(self) -> Optional[int]:
-        """The pre-release number (``0.9b3`` -> 3), or None."""
+        """The tag number of an alpha/beta (``0.9b3`` -> 3); None otherwise."""
         return split_program_version(self.app_version)[2]
 
     def as_dict(self) -> dict:
         """The stored fields (``_asdict()``) PLUS the derived ``release_version``,
-        ``stage`` and ``pre_number`` — for telemetry / JSON, where the derived
+        ``stage``, ``pre_number`` and ``build_kind`` — for telemetry / JSON, where the derived
         properties would otherwise be lost."""
         d = dict(self._asdict())
         d.update(release_version=self.release_version, stage=self.stage,
-                 pre_number=self.pre_number)
+                 pre_number=self.pre_number, build_kind=self.build_kind)
         return d
 
 
@@ -274,22 +296,20 @@ def _resolve_app_version(
     repo_root: Optional[Union[str, Path]], component: Optional[str],
 ) -> str:
     """Base version when the caller didn't pass one: the latest tag of ANY stage
-    (:func:`latest_program_tag`) — but once HEAD is AHEAD of it (any commit
-    after it) the NEXT STEP IN THE SAME PROGRAM, since a tag is frozen and
-    further commits are development toward the next one:
+    (:func:`latest_program_tag`), with the BUILD KIND as its suffix:
 
-    * release ``0.8`` -> ``0.9`` (next minor): tag ``0.8`` at commit 63 builds
-      as ``0.8-63``, the next commit as ``0.9-64``;
-    * pre-release ``0.9b2`` -> ``0.9b3`` (next number, same stage).
+    * HEAD on a tag: the tag itself — ``0.8`` (release), ``0.9a1`` (alpha),
+      ``0.9b2`` (beta). A dirty tree there keeps the tag's kind (the ``+`` flags
+      it).
+    * HEAD ahead of the tag: a DEVELOPMENT build, suffix ``d``, of the release in
+      flight — ``0.9d`` after release ``0.8`` (next minor) and after beta
+      ``0.9b2`` (same release). Tag ``0.8`` at commit 63 builds as ``0.8-63``, the
+      next commit as ``0.9d-64``, never mistakable for a production ``0.9``.
 
     Only tags REACHABLE from HEAD count (``git tag --merged HEAD``): a tag on an
     unmerged branch, or on a commit after HEAD (an older checkout), must not
-    shape this build's version.
-
-    At the tagged commit itself (clean or dirty) the tag version is kept. A
-    stage never advances on its own — alpha -> beta -> rc -> release is a
-    deliberate ``release.sh <component> beta|rc|release``. Major bumps stay a
-    deliberate ``release.sh <c> major``. No canonical tag -> :data:`NO_VERSION`."""
+    shape this build's version. Major bumps stay a deliberate
+    ``release.sh <c> major``. No canonical tag -> :data:`NO_VERSION`."""
     tag = latest_program_tag(repo_root, component, merged=True)
     if tag is None:
         return NO_VERSION
@@ -297,8 +317,10 @@ def _resolve_app_version(
     ref = f"refs/tags/{component}-{tag}" if component else f"refs/tags/{tag}"
     since = _git(["rev-list", "--count", f"{ref}..HEAD"], cwd, strict=True)
     if since is not None and since.isdigit() and int(since) > 0:
-        base, stage, n = split_program_version(tag)
-        return f"{base}{stage}{n + 1}" if stage else _next_minor(tag)
+        base, stage, _ = split_program_version(tag)
+        # Ahead of a tag = a DEVELOPMENT build of the release in flight: the next
+        # minor after a release tag, the same release after an alpha/beta tag.
+        return f"{base}d" if stage else f"{_next_minor(tag)}d"
     return tag
 
 
@@ -511,7 +533,7 @@ def latest_program_tag(
 ) -> Optional[str]:
     """Return the highest version of ANY stage — release or pre-release — or
     ``None``: ``0.9b2`` outranks ``0.9a3`` and ``0.8``, and the release ``0.9``
-    outranks all of ``0.9a*`` / ``0.9b*`` / ``0.9rc*``. Compared in Python (git's
+    outranks all of ``0.9a*`` / ``0.9b*``. Compared in Python (git's
     version sort would put ``0.9`` below ``0.9b1``). Unlike
     :func:`latest_version_tag`, which stays release-only for existing callers,
     this is what the build version derives from. Same ``component`` scoping and
@@ -560,7 +582,7 @@ def latest_versions(repo_root: Optional[Union[str, Path]] = None) -> "dict[Optio
 
 
 #: Like ``_ANY_VERSION_TAG_RE`` but also matching pre-release tags.
-_ANY_PROGRAM_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+(?:(?:a|b|rc)\d+)?)$")
+_ANY_PROGRAM_TAG_RE = re.compile(r"^(?:(.+)-)?(\d+(?:\.\d+)+(?:(?:a|b)\d+)?)$")
 
 
 def latest_programs(repo_root: Optional[Union[str, Path]] = None) -> "dict[Optional[str], str]":
@@ -607,18 +629,18 @@ def next_version(
     return pre + (f"{major + 1}.0" if part == "major" else f"{major}.{minor + 1}")
 
 
-_KINDS = {"alpha": "a", "beta": "b", "rc": "rc"}
+_KINDS = {"alpha": "a", "beta": "b"}
 
 
 def next_program_version(
     repo_root: Optional[Union[str, Path]], kind: str, component: Optional[str] = None,
 ) -> str:
-    """Next tag for advancing a program: ``kind`` is ``alpha`` / ``beta`` / ``rc``
-    / ``release``. Raises ``ValueError`` on an illegal move. From the latest tag
+    """Next tag for advancing a pre-release: ``kind`` is ``alpha`` / ``beta`` /
+    ``release``. Raises ``ValueError`` on an illegal move. From the latest tag
     of any stage:
 
-    * release ``0.8``: alpha/beta/rc start the next minor (``0.9a1`` / ``0.9b1``
-      / ``0.9rc1``); ``release`` is refused (nothing to promote).
+    * release ``0.8``: alpha/beta start the next minor (``0.9a1`` / ``0.9b1``);
+      ``release`` is refused (nothing to promote).
     * pre-release ``0.9a2``: same kind -> ``0.9a3``; a LATER stage starts it
       (``beta`` -> ``0.9b1``); ``release`` promotes it to ``0.9``; an EARLIER
       stage is refused (no going backwards).
@@ -628,7 +650,7 @@ def next_program_version(
     Returned bare (or ``<component>-…``), directly taggable. Uses ALL tags (not
     just reachable ones) so a number is never issued twice."""
     if kind != "release" and kind not in _KINDS:
-        raise ValueError(f"unknown program {kind!r} (alpha|beta|rc|release)")
+        raise ValueError(f"unknown build kind {kind!r} (alpha|beta|release)")
     latest = latest_program_tag(repo_root, component)
     pre = f"{component}-" if component else ""
     if latest is None:

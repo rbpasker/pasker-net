@@ -21,12 +21,12 @@ Any consumer may need to change it, and different consumers may be pinned to
 ## Releasing a component (version bump)
 
 Each module is versioned independently by **component-scoped git tags**
-(`<component>-<X.x>`, pre-releases `<component>-<X.x>a1` / `b1` / `rc1`) so a
+(`<component>-<X.x>`, pre-releases `<component>-<X.x>a1` / `b1`) so a
 bump to one never shadows another. Cut a release with `./release.sh`; it
 computes the next number from the existing tags. **Usage is not repeated here**
 — run `./release.sh` with no args, or see its header, `python3 -m versioning
 --help` and the `versioning/` section of [README.md](README.md) for the stages
-(`major|minor|alpha|beta|rc|release`) and exit codes.
+(`major|minor|alpha|beta|release`) and exit codes.
 
 Rules:
 

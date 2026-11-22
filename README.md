@@ -40,18 +40,22 @@ qworkers). PRs welcome. --Bob at y0u kn0w wh3r3
   - `short_version()` → `M.m-seq[+]` (e.g. `0.9b3-70+`; `+` = dirty), and
     `short_from_canonical(str)` derives it from either canonical form — the
     reference every port is tested against. `python3 -m versioning --short`.
-  - **Programs (alpha/beta/rc).** Tags `<X.x>a<N>` / `b<N>` / `rc<N>` (`0.9a1`,
-    `0.9b2`, `0.9rc1`) sort below the release `0.9`. Builds ahead of the newest
-    *reachable* tag preview the next step in the same program (`0.9b2` →
-    `0.9b3`; release `0.8` → `0.9`), so development never claims a released
-    number. Advance with `release.sh <component> alpha|beta|rc|release` (or
-    `--increment PROGRAM`), which refuses illegal moves (exit 3). A git
-    timeout is retried, then fails loudly (exit 2) rather than reporting
-    `NOVERSION`. `latest_version_tag()` stays release-only;
+  - **Build kinds.** Every build is `d` (development), `a` (alpha), `b` (beta)
+    or blank (release), written as a suffix on the version and derived from the
+    newest tag *reachable* from HEAD: `0.9-70` release, `0.9a1-70`, `0.9b2-70`,
+    `0.10d-71` development (any build ahead of a tag; the release in flight, so
+    `0.9d` after beta `0.9b2` too). A dirty tree on a tagged commit keeps the
+    tag's kind (the `+` flags it). `build_kind()` / `VersionParts.build_kind` /
+    `--build-kind` give the letter; what a kind means to an app (update channel,
+    audience) is the app's business. Alpha/beta tags are `<X.x>a<N>` / `b<N>`
+    and sort below the release. Advance with `release.sh <component>
+    alpha|beta|release` (or `--increment KIND`), which refuses illegal moves
+    (exit 3). A git timeout is retried, then fails loudly (exit 2) rather than
+    reporting `NOVERSION`. `latest_version_tag()` stays release-only;
     `latest_program_tag()` / `latest_programs()` include pre-releases.
   Ships `emit_swift.py` to generate a `CanonicalVersion` Swift enum from an
   Xcode Run Script Phase. The Swift `build` getter renders `X.x[<stage>]-<n>`
-  (marketing `X.x` from the plist + the baked pre-release `programSuffix` +
+  (marketing `X.x` from the plist + the baked build-kind `buildSuffix` +
   rev count `n`), so the in-app stamp matches Apple's `X.x (n)`; a dirty
   tree appends `-[<branch>-]dirty(<buildtime>)`. Stdlib only.
 - [`queuing/`](queuing/) — in-memory named FIFO queues backed by a
