@@ -138,6 +138,7 @@ asks the CLI for the next tag, tags `HEAD`, and pushes the tag:
 | `0.9a1` | `alpha` | `0.9a2` |
 | `0.9a2` | `beta` | `0.9b1` |
 | `0.8` (release) | `beta` | `0.9b1` (skipping alpha is fine) |
+| `0.9a2` | `release` | `0.9` (straight from alpha is fine; no beta needed) |
 | `0.9b1` | `release` | `0.9` (promotes it) |
 | `0.9` (release) | `minor` / `major` | `0.10` / `1.0` |
 | *(no tags)* | `alpha` / `minor` / `major` | `0.1a1` / `0.1` / `1.0` |
@@ -153,7 +154,8 @@ With `--component`/`release.sh <component>` every tag is prefixed
 Tags are `<X.x>a<N>` and `<X.x>b<N>` (`rc`, and anything hyphenated like
 `2.0-rc1`, are not tag kinds and are ignored). A pre-release sorts **below** the
 release it leads to. Numbers are computed from **all** tags (so none is issued
-twice), while builds read only tags reachable from `HEAD`. A stage never
+twice), while builds read only tags reachable from `HEAD`. Any pre-release can be promoted
+by `release`, alpha included. A stage never
 advances by itself — alpha → beta → release is always a deliberate tag.
 
 ## Lifecycle
