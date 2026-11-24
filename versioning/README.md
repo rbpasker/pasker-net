@@ -6,8 +6,9 @@ Stdlib only; the CLI is a single self-contained PEP 723 file.
 
 A git **tag** is the source of truth for the version number. The library *reads*
 the newest tag reachable from `HEAD` and stamps it with live git state; the CLI
-and `release.sh` *compute* the next tag. Between releases a build reads as
-"development build of the release in flight".
+and `release.sh` *compute* the next tag. After a release
+tag, builds read as a development build of the next minor; promoting it is a
+deliberate tag per stage.
 
 ## What a version looks like
 
@@ -16,19 +17,26 @@ from the newest tag reachable from `HEAD`:
 
 | kind | meaning | version | short | server canonical |
 |---|---|---|---|---|
-| blank | release (`HEAD` is on tag `0.9`) | `0.9` | `0.9-6` | `0.9-6-23e668c` |
-| `a` | alpha (`HEAD` is on tag `0.9a1`) | `0.9a1` | `0.9a1-4` | `0.9a1-4-64edc5d` |
-| `b` | beta (`HEAD` is on tag `0.9b1`) | `0.9b1` | `0.9b1-5` | `0.9b1-5-c0cd419` |
-| `d` | development: any commit **after** a tag | `0.10d` | `0.10d-7` | `0.10d-7-3115697` |
+| blank | release (`HEAD` is at or after tag `0.9`, until the next minor starts) | `0.9` | `0.9-6` | `0.9-6-23e668c` |
+| `a` | alpha (tag `0.10a` is reachable) | `0.10a` | `0.10a-4` | `0.10a-4-64edc5d` |
+| `b` | beta (tag `0.10b` is reachable) | `0.10b` | `0.10b-5` | `0.10b-5-c0cd419` |
+| `d` | development: ahead of a **release** tag | `0.10d` | `0.10d-7` | `0.10d-7-3115697` |
 
-- A development build is a build of the **release in flight**: the next minor
-  after a release tag (`0.9` → `0.10d`), the same release after an alpha/beta tag
-  (`0.9b1` → `0.9d`). It can never be mistaken for a production `0.9`.
-- A dirty tree keeps the tag's kind and gains a `+` (short) / `-dirty` (long):
-  `0.9b1-5+`. The kind says what was tagged; the `+` says the tree isn't it.
+The kind is one letter, no number. It says what stage the minor version is in.
+
+- After release tag `0.9` every build is `0.10d-<seq>`. Promoting a tested build
+  tags `0.10a`; builds are `0.10a-<seq>` until `0.10b` is tagged, then
+  `0.10b-<seq>` until `0.10`. A stage lasts until the next promotion, and each
+  stage of a minor is tagged once; `seq` alone tells builds apart.
+- `d` is never a tag, so a development build can't be mistaken for a production
+  `0.10`.
+- A dirty tree keeps its kind and gains a `+` (short) / `-dirty` (long):
+  `0.10b-5+`. The kind says what was tagged; the `+` says the tree isn't it.
 - No tags at all → `NOVERSION` (e.g. `NOVERSION-2`), no kind.
 - Only tags **reachable from `HEAD`** count. A tag on an unmerged branch, or on a
   commit after `HEAD` (an older checkout), never shapes this build's version.
+- Numbered stages (`0.9a1`, `0.9b2`) are not versions: such a tag is ignored, and
+  a numbered string parses as a bare, kind-less version.
 - What a kind *means to an app* (update channel, audience, badge) is the app's
   business; this library only says what kind of build it is.
 
@@ -56,13 +64,13 @@ build_number(ROOT)                                # 7
   has no hash; the branch shows only when dirty, and a dirty build stamps a
   Zulu build time in place of the missing commit.
 - **Short form** `M.m-seq[+]` — major.minor, sequence, `+` if dirty. A patch
-  component is dropped (`1.3.4` → `1.3`); the kind is kept (`0.9b1-5`, `0.10d-7`).
+  component is dropped (`1.3.4` → `1.3`); the kind is kept (`0.9b-5`, `0.10d-7`).
   `short_from_canonical("0.10d-7-3115697-dirty") == "0.10d-7+"` derives it from
   either canonical string — the reference every port (Swift, JS, …) is tested
   against. A bare tag with no seq is `2.0-unknown`; `NOVERSION-unknown` stays.
 - **Parsing.** `parse_canonical_version(s)` returns a `VersionParts`
   (`app_version`, `branch`, `rev_number`, `commit`, `dirty`, `build_time`,
-  `os_version`) plus derived `release_version`, `stage`, `pre_number` and
+  `os_version`) plus derived `release_version`, `stage` and
   `build_kind` (`"d"`, `"a"`, `"b"`, `""`). `.as_dict()` includes the derived
   fields.
 - **Component lineages.** `component="server"` (CLI `--component server`) reads
@@ -113,7 +121,7 @@ versioning --component server
 | `--build-kind` | `d`, `a`, `b`, or an empty line for a release |
 | `--build-number` | `git rev-list --count HEAD` |
 | `--list` | every component's latest tag of any stage and its commit |
-| `--increment alpha\|beta\|release` | the next pre-release tag (see below) |
+| `--increment alpha\|beta\|release` | the next promotion tag (see below) |
 | `--increment-major` / `--increment-minor` | the next release tag: `2.3` → `3.0` / `2.4` |
 | `-v` | the derivation (component, base tag, branch, commit, dirty) on stderr |
 
@@ -134,67 +142,71 @@ asks the CLI for the next tag, tags `HEAD`, and pushes the tag:
 
 | from the latest tag | command | tags |
 |---|---|---|
-| `0.8` (release) | `alpha` | `0.9a1` |
-| `0.9a1` | `alpha` | `0.9a2` |
-| `0.9a2` | `beta` | `0.9b1` |
-| `0.8` (release) | `beta` | `0.9b1` (skipping alpha is fine) |
-| `0.9a2` | `release` | `0.9` (straight from alpha is fine; no beta needed) |
-| `0.9b1` | `release` | `0.9` (promotes it) |
-| `0.9` (release) | `minor` / `major` | `0.10` / `1.0` |
-| *(no tags)* | `alpha` / `minor` / `major` | `0.1a1` / `0.1` / `1.0` |
+| `0.8` (release) | `alpha` | `0.9a` |
+| `0.8` (release) | `beta` | `0.9b` (skipping alpha is fine) |
+| `0.9a` | `beta` | `0.9b` |
+| `0.9a` | `release` | `0.9` (straight from alpha is fine; no beta needed) |
+| `0.9b` | `release` | `0.9` |
+| `0.9` (release) | `minor` / `major` | `0.10` / `1.0` (release directly, no stages) |
+| *(no tags)* | `alpha` / `minor` / `major` | `0.1a` / `0.1` / `1.0` |
 
 With `--component`/`release.sh <component>` every tag is prefixed
-(`server-0.9a1`). Illegal moves are refused with exit 3 and tag nothing:
+(`server-0.9a`). Illegal moves are refused with exit 3 and tag nothing:
 
-- going backwards (`alpha` after `0.9b1`),
+- going backwards (`alpha` after `0.9b`),
+- tagging a stage twice (`alpha` when `0.9a` is the latest tag),
 - `release` when the latest tag is already a release (nothing to promote),
-- `minor` while a pre-release is the latest tag (use `release` to promote it;
+- `minor` while a stage tag is the latest (use `release` to promote it;
   `major` is allowed as a deliberate jump).
 
-Tags are `<X.x>a<N>` and `<X.x>b<N>` (`rc`, and anything hyphenated like
-`2.0-rc1`, are not tag kinds and are ignored). A pre-release sorts **below** the
-release it leads to. Numbers are computed from **all** tags (so none is issued
-twice), while builds read only tags reachable from `HEAD`. Any pre-release can be promoted
-by `release`, alpha included. A stage never
-advances by itself — alpha → beta → release is always a deliberate tag.
+Tags are `<X.x>a` and `<X.x>b`, no number (`rc`, numbered stages like `0.9a1`,
+and anything hyphenated like `2.0-rc1`, are not tag kinds and are ignored). A
+stage sorts **below** the release it leads to. The next tag is computed from
+**all** tags (so a stage is never issued twice), while builds read only tags
+reachable from `HEAD`. A stage never advances by itself — d → a → b → release is
+always a deliberate tag.
+
+A new major that should go through stages isn't reachable with `alpha`/`beta`
+(they stay on the next minor): tag it by hand, `git tag -a 1.0a -m 1.0a`, and
+promote from there; `--increment-major` tags the bare release `1.0`.
 
 ## Lifecycle
 
 A repo using the `server` lineage, with real output (`--short` unless shown):
 
 ```text
-$ versioning --component server --short            # fresh repo, no tags
-NOVERSION-2
 $ git tag -a server-0.8 -m 0.8                     # a first release
 $ versioning --component server --short
-0.8-2
+0.8-1
   ... 2 commits land ...
 $ versioning --component server --short            # development build of 0.9
-0.9d-4
-$ ./release.sh server alpha                        # -> server-0.9a1
+0.9d-3
+$ ./release.sh server alpha                        # -> server-0.9a
 $ versioning --component server --short
-0.9a1-4
+0.9a-3
   ... a commit lands ...
+$ versioning --component server --short            # the stage lasts
+0.9a-4
+$ ./release.sh server alpha                        # a stage is tagged once
+error: server-0.9a is already alpha; each stage is tagged once      [exit 3]
+$ ./release.sh server beta                         # -> server-0.9b
 $ versioning --component server --short
-0.9d-5
-$ ./release.sh server beta                         # -> server-0.9b1
-$ versioning --component server --short
-0.9b1-5
+0.9b-4
   ... uncommitted edit ...
-$ versioning --component server --short            # tag's kind kept, flagged dirty
-0.9b1-5+
+$ versioning --component server --short            # kind kept, flagged dirty
+0.9b-4+
 $ versioning --component server --increment alpha  # can't go back
-error: cannot go back from server-0.9b1 to alpha      [exit 3]
+error: cannot go back from server-0.9b to alpha      [exit 3]
 $ ./release.sh server release                      # promote -> server-0.9
 $ versioning --component server --short
-0.9-6
+0.9-4
   ... a commit lands ...
-$ versioning --component server --short            # next release in flight
-0.10d-7
+$ versioning --component server --short            # next minor in flight
+0.10d-5
 $ versioning --component server --build-kind
 d
 $ versioning --list
-server  0.9  23e668c
+server  0.9  5bc3732
 ```
 
 ## Quick start
@@ -269,7 +281,7 @@ python3 "${SRCROOT}/../../vendor/pasker-net/versioning/emit_swift.py" \
 
 Baked at build time: `gitBranch`, `gitCommit`, `gitDirty`, `revNumber`,
 `buildTime` (dirty builds only), **`buildKind`** (`"d"`/`"a"`/`"b"`/`""`),
-**`buildSuffix`** (kind + tag number: `""`, `"d"`, `"a1"`, `"b3"`) and
+**`buildSuffix`** (the kind as a suffix, the same letter: `""`, `"d"`, `"a"`, `"b"`) and
 **`tagAppVersion`** (what the tags imply, e.g. `"0.10d"`). The marketing version
 still comes from the plist's `CFBundleShortVersionString` at runtime — Apple
 requires it to be digits and dots only, which is why the kind is baked

@@ -8,9 +8,9 @@
 # Examples:
 #   ./release.sh secretvault major     # first release -> secretvault-1.0
 #   ./release.sh queuing minor         # next minor    -> queuing-1.1
-#   ./release.sh queuing alpha         # 1.1 -> queuing-1.2a1 (then alpha again: 1.2a2)
-#   ./release.sh queuing beta          # 1.2a2 -> queuing-1.2b1
-#   ./release.sh queuing release       # promote the pre-release -> queuing-1.2
+#   ./release.sh queuing alpha         # 1.1 -> queuing-1.2a (each stage is tagged once)
+#   ./release.sh queuing beta          # 1.2a -> queuing-1.2b
+#   ./release.sh queuing release       # promote the stage (alpha or beta) -> queuing-1.2
 #
 # The component scopes the tag namespace (`<component>-<X.x>`), so modules
 # release independently without shadowing each other (queuing-1.0 vs

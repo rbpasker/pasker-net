@@ -20,9 +20,9 @@ The emitted file declares an ``enum`` (Swift's idiomatic namespace) with:
     ``[-<branch>]-dirty (<buildTime>)`` (a Zulu-time stamp). Mirrors the Python
     ``canonical_version_client`` (rev, no commit hash).
   * ``buildKind`` / ``buildSuffix`` / ``tagAppVersion`` — the build kind (``d`` /
-    ``a`` / ``b`` / empty), kind + number (``b3``) and tag-derived version, baked
-    from the git tags (Apple's plist version can't hold a kind); ``build``
-    appends the suffix: ``0.9b3-70``, ``0.10d-71``
+    ``a`` / ``b`` / empty), its suffix (the same letter) and the tag-derived
+    version, baked from the git tags (Apple's plist version can't hold a kind);
+    ``build`` appends the suffix: ``0.9b-70``, ``0.10d-71``
   * ``full`` — ``<build> (<os>)``
 
 Note: ``#if os(iOS)`` is true on iPad as well — Swift has no
@@ -54,8 +54,7 @@ from pathlib import Path
 # Allow running as a script without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from versioning.versioning import (  # noqa: E402
-    _git, _is_dirty, _resolve_app_version, _stage_suffix, build_kind, build_number,
-    split_program_version,
+    _git, _is_dirty, _resolve_app_version, build_kind, build_number,
 )
 
 
@@ -78,18 +77,18 @@ enum {type_name} {{
     /// recoverable from its commit; a dirty build has no commit to point at.
     static let buildTime = "{build_time}"
 
-    /// Build kind, from the git tags: "d" development (any build ahead of a tag),
+    /// Build kind, from the git tags: "d" development (ahead of a release tag),
     /// "a" alpha, "b" beta, "" release. What a kind means to the app (update
     /// channel, audience) is the app's business — compare this, don't parse it.
     static let buildKind = "{build_kind}"
 
-    /// The kind plus its tag number: "" release, "d" development, "a1" / "b3" for
-    /// an alpha / beta. Apple requires CFBundleShortVersionString to be digits and
+    /// The kind as a version suffix: "" release, "d" development, "a" alpha, "b"
+    /// beta. Apple requires CFBundleShortVersionString to be digits and
     /// dots only, so this cannot live in the plist — it is baked here and appended
     /// in `build`.
     static let buildSuffix = "{build_suffix}"
 
-    /// The app version the git tags imply for this build ("0.9b3", "0.10", "0.8").
+    /// The app version the git tags imply for this build ("0.9b", "0.10", "0.8").
     /// Compare its release part with `appVersion` to catch a plist whose
     /// MARKETING_VERSION has drifted from the tags (`appVersionMatchesTags`).
     static let tagAppVersion = "{tag_app_version}"
@@ -104,7 +103,7 @@ enum {type_name} {{
     }}
 
     /// True when the plist's marketing version equals the release part of the
-    /// tag-derived version (`0.9` for `0.9b3`), ignoring a patch component.
+    /// tag-derived version (`0.9` for `0.9b`), ignoring a patch component.
     static var appVersionMatchesTags: Bool {{
         let tag = tagAppVersion.split(whereSeparator: {{ !"0123456789.".contains($0) }}).first.map(String.init) ?? tagAppVersion
         let a = appVersion.split(separator: ".").prefix(2).joined(separator: ".")
@@ -113,7 +112,7 @@ enum {type_name} {{
     }}
 
     /// Clean: "<X.x><kind>-<revNumber>" — Apple's "X.x (revNumber)" with the
-    /// build kind (if any) after the version, e.g. "0.9b3-70" or "0.10d-71".
+    /// build kind (if any) after the version, e.g. "0.9b-70" or "0.10d-71".
     /// Dirty: appends "-[<branch>-]dirty (<buildTime>)" (branch omitted on a
     /// trunk branch / detached HEAD).
     static var build: String {{
@@ -172,9 +171,8 @@ def emit(
     cwd = repo_root or None
     # Raises GitError if the tag lookup times out (fails the build loudly, not NOVERSION).
     tag_version = _resolve_app_version(cwd, component)
-    _, stage, number = split_program_version(tag_version)
-    suffix = _stage_suffix(stage, number)
     kind = build_kind(tag_version)
+    suffix = kind
     branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd) or ""
     commit = _git(["rev-parse", "--short", "HEAD"], cwd) or "unknown"
     dirty = _is_dirty(cwd)

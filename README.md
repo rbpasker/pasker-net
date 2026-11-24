@@ -87,8 +87,8 @@ or `--increment {alpha,beta,release}`, creates an annotated `<component>-<tag>` 
 on `HEAD`, pushes it to `origin`, and prints the resulting version (`-v`). A minor
 bump is `+.1` (`2.3 → 2.4`); a major bump is `+1` with minor reset (`2.3 → 3.0`).
 With no prior tag they bootstrap from `0.0`, so a first major bump lands at `1.0`
-and a first minor bump at `0.1`. `alpha` / `beta` tag pre-releases (`1.2a1`,
-`1.2b1`) and `release` promotes one (`1.2b1` → `1.2`); illegal moves are refused
+and a first minor bump at `0.1`. `alpha` / `beta` tag stages (`1.2a`,
+`1.2b`, one tag each) and `release` promotes one (`1.2b` → `1.2`); illegal moves are refused
 and tag nothing. Land the change on `main` **first** — the tag goes on `HEAD`.
 The stages, build kinds (`d` / `a` / `b` / release) and exit codes are in
 [`versioning/README.md`](versioning/README.md); or run `./release.sh` for usage.
@@ -99,7 +99,7 @@ The stages, build kinds (`d` / `a` / `b` / release) and exit codes are in
 ```
 
 Each module releases on its own lineage, so `queuing-1.0`, `qworkers-1.0`,
-`secretvault-1.2b1`, and `versioning-1.5b3` advance independently and never
+`secretvault-1.1`, and `versioning-1.4` advance independently and never
 shadow each other. `--list` shows every component's latest tag — pre-releases
 included — and the commit it was cut at, at a glance:
 
@@ -107,8 +107,8 @@ included — and the commit it was cut at, at a glance:
 $ python3 -m versioning --list
 queuing      1.0    4ed7dad
 qworkers     1.0    4ed7dad
-secretvault  1.2b1  80a7e30
-versioning   1.5b3  717bd42
+secretvault  1.1    17c141d
+versioning   1.4    abae092
 ```
 
 To read one module's live version, scope the query to its component (this is

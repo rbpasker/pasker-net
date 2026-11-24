@@ -30,9 +30,10 @@ derives it from a canonical string, as the reference for ports to test against.
 
 Build kinds: every build is one of ``d`` (development), ``a`` (alpha), ``b``
 (beta) or blank (release), derived from the tags reachable from HEAD and written
-as a suffix on the version — ``0.9-70`` release, ``0.9a1-70``, ``0.9b2-70``,
-``0.10d-71`` development (any build ahead of a tag). Alpha/beta tags are
-``0.9a1`` / ``0.9b2`` and sort below the release ``0.9``. :func:`build_kind`
+as a one-letter suffix on the version — ``0.9-70`` release, ``0.9a-70``, ``0.9b-70``,
+``0.10d-71`` development (ahead of a release tag). Stage tags are bare letters,
+``0.9a`` / ``0.9b``, tagged once each, and sort below the release ``0.9``; a stage
+lasts until the next promotion is tagged. :func:`build_kind`
 returns the letter; what a kind means to an app (update channel, audience) is the
 app's business. See :func:`latest_program_tag`.
 
